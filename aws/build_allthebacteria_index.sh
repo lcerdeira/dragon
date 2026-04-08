@@ -29,7 +29,7 @@ set -euo pipefail
 # ---- Configuration ----
 ATB_RELEASE="${ATB_RELEASE:-0.2}"
 ATB_FTP="https://ftp.ebi.ac.uk/pub/databases/AllTheBacteria/Releases"
-DRAGON="$HOME/Dragon/target/release/dragon"
+DRAGON="${DRAGON:-$HOME/Dragon/target/release/dragon}"
 WORKSPACE="$HOME/dragon_workspace/allthebacteria"
 GENOME_DIR="$WORKSPACE/genomes"
 INDEX_DIR="$HOME/dragon_index_allthebacteria"

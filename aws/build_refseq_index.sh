@@ -32,7 +32,7 @@ set -euo pipefail
 # ---- Configuration ----
 REFSEQ_FTP="https://ftp.ncbi.nlm.nih.gov/genomes/refseq/bacteria"
 ASSEMBLY_SUMMARY_URL="$REFSEQ_FTP/assembly_summary.txt"
-DRAGON="$HOME/Dragon/target/release/dragon"
+DRAGON="${DRAGON:-$HOME/Dragon/target/release/dragon}"
 WORKSPACE="$HOME/dragon_workspace/refseq"
 GENOME_DIR="$WORKSPACE/genomes"
 INDEX_DIR="$HOME/dragon_index_refseq"
