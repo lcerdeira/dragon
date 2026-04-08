@@ -57,12 +57,12 @@ fn build_with_ggcat(
 ) -> Result<DbgResult> {
     let unitig_file = output_dir.join("unitigs.fa");
 
-    // Create input file list
+    // Create input file list with absolute paths (GGCAT resolves relative to its CWD)
     let file_list = output_dir.join("input_files.txt");
     let genome_files = crate::io::fasta::list_fasta_files(genome_dir)?;
     let file_list_content: String = genome_files
         .iter()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()).to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(&file_list, file_list_content)?;
@@ -96,38 +96,52 @@ fn build_with_ggcat(
         anyhow::bail!("GGCAT exited with non-zero status: {}", status);
     }
 
-    // GGCAT v2 embeds colors in FASTA headers: >unitig_id LN:i:len C:genome:count ...
-    // Convert to TSV format that Dragon's color index builder expects.
-    log::info!("Parsing GGCAT color annotations from unitig headers...");
+    // Extract proper per-unitig color sets using ggcat query.
+    // GGCAT's C: tags in FASTA headers use internal color-set IDs, not genome indices.
+    // We use ggcat query --colors on the unitigs to get actual genome assignments.
+    log::info!("Extracting unitig colors via ggcat query...");
     let color_file = output_dir.join("colors.tsv");
     {
         use std::io::{BufRead, Write};
-        let reader = std::io::BufReader::new(std::fs::File::open(&unitig_file)?);
+
+        let query_output = output_dir.join("unitig_colors");
+        let query_status = std::process::Command::new("ggcat")
+            .args([
+                "query",
+                "--colors",
+                "-k", &kmer_size.to_string(),
+                "--colored-query-output-format", "json-lines-with-numbers",
+                "-o", &query_output.to_string_lossy(),
+                &unitig_file.to_string_lossy(),
+                &unitig_file.to_string_lossy(),
+            ])
+            .status()
+            .context("Failed to run ggcat query for color extraction")?;
+
+        if !query_status.success() {
+            anyhow::bail!("ggcat query failed during color extraction");
+        }
+
+        // Parse JSONL: each line = {"query_index":N, "matches":{"genome_id": coverage, ...}}
+        let jsonl_path = query_output.with_extension("jsonl");
+        let reader = std::io::BufReader::new(std::fs::File::open(&jsonl_path)?);
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&color_file)?);
 
         for line in reader.lines() {
             let line = line?;
-            if !line.starts_with('>') {
-                continue;
-            }
-            // Parse: >unitig_id [LN:i:len] [C:genome_id:count] ...
-            let parts: Vec<&str> = line[1..].split_whitespace().collect();
-            let unitig_id = parts.first().unwrap_or(&"0");
-            let mut genome_ids: Vec<String> = Vec::new();
-            for part in &parts[1..] {
-                if let Some(rest) = part.strip_prefix("C:") {
-                    // C:genome_id:count
-                    if let Some(gid) = rest.split(':').next() {
-                        genome_ids.push(gid.to_string());
-                    }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let uid = val.get("query_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                if let Some(matches) = val.get("matches").and_then(|m| m.as_object()) {
+                    let genome_ids: Vec<String> = matches.keys().cloned().collect();
+                    writeln!(writer, "{}\t{}", uid, genome_ids.join(","))?;
+                } else {
+                    writeln!(writer, "{}\t", uid)?;
                 }
             }
-            if !genome_ids.is_empty() {
-                writeln!(writer, "{}\t{}", unitig_id, genome_ids.join(","))?;
-            } else {
-                writeln!(writer, "{}\t", unitig_id)?;
-            }
         }
+
+        // Clean up
+        let _ = std::fs::remove_file(&jsonl_path);
     }
 
     // Count unitigs
