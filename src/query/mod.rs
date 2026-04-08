@@ -12,6 +12,7 @@ use std::path::Path;
 use crate::io::paf::PafRecord;
 
 /// Configuration for a search query.
+#[derive(Clone)]
 pub struct SearchConfig {
     pub index_dir: Box<Path>,
     pub min_seed_len: usize,
@@ -34,6 +35,9 @@ pub struct SearchConfig {
     pub ml_weights_path: Option<String>,
     /// If set, dump all seeds with features to this TSV path (for ML training).
     pub dump_seeds_path: Option<String>,
+    /// Ground truth genome name (for labeling training data).
+    /// When set, seeds matching this genome get label=1, others get label=0.
+    pub ground_truth_genome: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -52,6 +56,7 @@ impl Default for SearchConfig {
             no_ml: false,
             ml_weights_path: None,
             dump_seeds_path: None,
+            ground_truth_genome: None,
         }
     }
 }
@@ -74,7 +79,11 @@ pub fn search(
     let fm_index = crate::index::fm::load_fm_index(&config.index_dir)?;
     let color_index = crate::index::color::load_color_index(&config.index_dir)?;
     let path_index = crate::index::paths::load_path_index(&config.index_dir)?;
-    let _metadata = crate::index::metadata::load_metadata(&config.index_dir)?;
+    let specificity_index = crate::index::specificity::SpecificityIndex::load_or_build(
+        &config.index_dir,
+        &color_index,
+    ).ok();
+    let metadata = crate::index::metadata::load_metadata(&config.index_dir)?;
 
     // Reconstruct UnitigSet from FM-index text + cumulative lengths
     let unitig_lengths: Vec<u64> = fm_index.cumulative_lengths.lengths().to_vec();
@@ -92,13 +101,17 @@ pub fn search(
         Some(ml_score::SeedScorer::load_or_default(&config.index_dir))
     };
 
-    // Open seed dump file if requested
+    // Open seed dump file if requested (for ML training data)
     let mut seed_dump: Option<Box<dyn std::io::Write>> = if let Some(ref path) = config.dump_seeds_path {
         log::info!("Dumping seed features to {:?}", path);
+        if let Some(ref gt) = config.ground_truth_genome {
+            log::info!("Ground truth genome: {:?} (seeds will be labeled)", gt);
+        }
         let file = std::fs::File::create(path)?;
         let mut writer = Box::new(std::io::BufWriter::new(file)) as Box<dyn std::io::Write>;
         use std::io::Write;
-        writeln!(writer, "query_name\tunitig_id\tquery_pos\tmatch_len\tsa_count\tgenome_id\tcolor_card\tgc_content")?;
+        writeln!(writer, "query_name\tgenome_id\tgenome_name\t{}\tlabel",
+            ml_score::SeedFeatures::header())?;
         Some(writer)
     } else {
         None
@@ -132,34 +145,47 @@ pub fn search(
         // Stage 2: Identify candidate genomes via color voting
         let candidates = candidate::find_candidates(&seeds, &color_index, min_votes);
 
-        // Dump seeds if requested (for ML training data generation)
+        // Dump seeds with full ML features if requested (for training data generation)
         if let Some(ref mut writer) = seed_dump {
             use std::io::Write;
+            // Collect all seed positions for local density computation
+            let all_positions: Vec<usize> = candidates
+                .iter()
+                .flat_map(|c| c.seeds.iter().map(|s| s.query_pos))
+                .collect();
+
             for cand in &candidates {
+                let genome_name = metadata.genome_names
+                    .get(cand.genome_id as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("genome_{}", cand.genome_id));
+
+                // Label: 1 if this genome matches ground truth, 0 otherwise, -1 if no ground truth
+                let label = match &config.ground_truth_genome {
+                    Some(gt) => if genome_name.contains(gt.as_str()) { 1i8 } else { 0i8 },
+                    None => -1i8,
+                };
+
                 for seed in &cand.seeds {
-                    let color_card = color_index
-                        .get_colors(seed.unitig_id)
-                        .map(|c| c.len())
-                        .unwrap_or(0);
-                    let gc = if seed.match_len > 0 && seed.query_pos + seed.match_len <= query.seq.len() {
-                        let region = &query.seq[seed.query_pos..seed.query_pos + seed.match_len];
-                        let gc = region.iter().filter(|&&b| matches!(b, b'G' | b'g' | b'C' | b'c')).count();
-                        gc as f64 / seed.match_len as f64
-                    } else {
-                        0.5
-                    };
+                    let features = ml_score::SeedFeatures::from_seed_with_context(
+                        seed,
+                        query.seq.len(),
+                        &query.seq,
+                        &color_index,
+                        &all_positions,
+                    );
                     let _ = writeln!(
                         writer,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
-                        query.name, seed.unitig_id, seed.query_pos, seed.match_len,
-                        seed.sa_count, cand.genome_id, color_card, gc
+                        "{}\t{}\t{}\t{}\t{}",
+                        query.name, cand.genome_id, genome_name,
+                        features.as_tsv(), label
                     );
                 }
             }
         }
 
         // Stage 3: Colinear chaining per candidate genome (with ML seed scoring)
-        let chains = chain::chain_candidates_with_query_len(
+        let mut chains = chain::chain_candidates_with_query_len(
             &seeds,
             &candidates,
             &path_index,
@@ -169,6 +195,30 @@ pub fn search(
             &color_index,
             &query.seq,
         );
+
+        // Stage 3b: Specificity-boosted re-ranking
+        // Boost chains that contain genome-specific unitigs. This helps
+        // discriminate within-species (e.g., 50 E. coli that share most k-mers
+        // but differ in their private unitig hits).
+        if let Some(ref spec_index) = specificity_index {
+            // Collect all hit unitig IDs from seeds for this query
+            let mut hit_unitigs = roaring::RoaringBitmap::new();
+            for seed in &seeds {
+                hit_unitigs.insert(seed.unitig_id);
+            }
+
+            // Re-sort chains by combined score: containment + specificity bonus
+            chains.sort_by(|a, b| {
+                let a_match: usize = a.anchors.iter().map(|anc| anc.match_len).sum();
+                let b_match: usize = b.anchors.iter().map(|anc| anc.match_len).sum();
+                let a_spec = spec_index.specificity_score(a.genome_id, &hit_unitigs);
+                let b_spec = spec_index.specificity_score(b.genome_id, &hit_unitigs);
+                // Combined score: containment (matching bases) + specificity bonus
+                let a_combined = a_match as f64 + a_spec;
+                let b_combined = b_match as f64 + b_spec;
+                b_combined.partial_cmp(&a_combined).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         // Stage 4: Extract reference and align
         let mut alignments = align::align_chains(
@@ -231,6 +281,78 @@ pub fn search(
             query_len: query.seq.len(),
             alignments,
         });
+    }
+
+    Ok(results)
+}
+
+/// Search with overlay support: searches base index + all overlays, merges results.
+///
+/// If no overlays exist, behaves identically to `search()`.
+pub fn search_with_overlays(
+    query_file: &Path,
+    config: &SearchConfig,
+) -> Result<Vec<QueryResult>> {
+    // Search the base index
+    let mut results = search(query_file, config)?;
+
+    // Check for overlays
+    let manifest = crate::index::update::OverlayManifest::load_or_create(&config.index_dir);
+    let manifest = match manifest {
+        Ok(m) if m.overlay_count > 0 => m,
+        _ => return Ok(results), // No overlays, return base results
+    };
+
+    log::info!(
+        "Searching {} overlay(s) ({} additional genomes)",
+        manifest.overlay_count,
+        manifest.overlay_genomes
+    );
+
+    // Search each overlay
+    for overlay_dir in manifest.overlay_dirs(&config.index_dir) {
+        if !overlay_dir.exists() {
+            log::warn!("Overlay directory {:?} not found, skipping", overlay_dir);
+            continue;
+        }
+
+        let overlay_config = SearchConfig {
+            index_dir: overlay_dir.into(),
+            ..config.clone()
+        };
+
+        match search(query_file, &overlay_config) {
+            Ok(overlay_results) => {
+                // Merge overlay results into base results
+                for (base_result, overlay_result) in results.iter_mut().zip(overlay_results) {
+                    base_result.alignments.extend(overlay_result.alignments);
+                }
+            }
+            Err(e) => {
+                log::warn!("Overlay search failed: {}, skipping", e);
+            }
+        }
+    }
+
+    // Re-sort and deduplicate merged results
+    for result in &mut results {
+        // Sort by alignment score descending
+        result.alignments.sort_by(|a, b| {
+            let a_score = a.tags.iter()
+                .find_map(|t| t.strip_prefix("AS:i:").and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0);
+            let b_score = b.tags.iter()
+                .find_map(|t| t.strip_prefix("AS:i:").and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0);
+            b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Per-genome deduplication
+        let mut seen = HashSet::new();
+        result.alignments.retain(|record| seen.insert(record.target_name.clone()));
+
+        // Enforce max targets
+        result.alignments.truncate(config.max_target_seqs);
     }
 
     Ok(results)

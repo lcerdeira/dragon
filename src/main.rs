@@ -115,6 +115,10 @@ enum Commands {
         /// Dump all seeds with features to a TSV file (for ML training)
         #[arg(long)]
         dump_seeds: Option<String>,
+
+        /// Ground truth genome name for labeling training data (used with --dump-seeds)
+        #[arg(long)]
+        ground_truth: Option<String>,
     },
 
     /// Display information about a Dragon index
@@ -223,6 +227,86 @@ enum Commands {
         #[arg(short = 'j', long, default_value = "4")]
         threads: usize,
     },
+
+    /// Add new genomes to an existing index without full rebuild
+    ///
+    /// Builds a lightweight overlay index from new genomes. Queries automatically
+    /// search both the base index and all overlays. When overlays exceed 10% of
+    /// the base, a warning suggests running `dragon compact` for optimal performance.
+    Update {
+        /// Path to the existing Dragon index
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Directory containing new genome FASTA files to add
+        #[arg(short = 'g', long)]
+        genomes: PathBuf,
+
+        /// K-mer size (must match the existing index)
+        #[arg(short, long, default_value = "31")]
+        kmer_size: usize,
+
+        /// Number of threads
+        #[arg(short = 'j', long, default_value = "4")]
+        threads: usize,
+
+        /// Hardware profile: laptop or workstation
+        #[arg(long, default_value = "workstation")]
+        profile: String,
+    },
+
+    /// Compact overlays by rebuilding the full index
+    ///
+    /// Merges the base index and all overlay indices into a single optimized index.
+    /// Run this when `dragon update` warns that overlays have grown large.
+    Compact {
+        /// Path to the Dragon index to compact
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Directory containing ALL genome FASTA files (base + overlay genomes)
+        #[arg(short = 'g', long)]
+        genomes: PathBuf,
+
+        /// K-mer size
+        #[arg(short, long, default_value = "31")]
+        kmer_size: usize,
+
+        /// Number of threads
+        #[arg(short = 'j', long, default_value = "4")]
+        threads: usize,
+
+        /// Hardware profile: laptop or workstation
+        #[arg(long, default_value = "workstation")]
+        profile: String,
+    },
+
+    /// Generate a surveillance report from alignment results
+    ///
+    /// Reads PAF output from `dragon search` and produces a prevalence summary
+    /// with species-level statistics, ANI distributions, and diversity metrics.
+    /// Designed for AMR gene surveillance and epidemiological queries.
+    Summarize {
+        /// Input PAF file from `dragon search` (use "-" for stdin)
+        #[arg(short, long)]
+        input: String,
+
+        /// Output file (use "-" for stdout)
+        #[arg(short, long, default_value = "-")]
+        output: String,
+
+        /// Output format: tsv or json
+        #[arg(long, default_value = "tsv")]
+        format: String,
+
+        /// Path to Dragon index (for genome count; optional, uses PAF data otherwise)
+        #[arg(long)]
+        index: Option<PathBuf>,
+
+        /// Total genomes in database (overrides --index metadata)
+        #[arg(long)]
+        total_genomes: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -276,6 +360,7 @@ fn main() -> Result<()> {
             no_ml,
             ml_weights,
             dump_seeds,
+            ground_truth,
         } => {
             log::info!("Dragon search");
 
@@ -302,9 +387,10 @@ fn main() -> Result<()> {
                 no_ml,
                 ml_weights_path: ml_weights,
                 dump_seeds_path: dump_seeds,
+                ground_truth_genome: ground_truth,
             };
 
-            let results = dragon::query::search(&query, &config)?;
+            let results = dragon::query::search_with_overlays(&query, &config)?;
 
             // Write output
             let mut writer: Box<dyn std::io::Write> = if output == "-" {
@@ -1001,6 +1087,129 @@ echo "  Download complete."
                 "Signal search complete: {} reads, {} total hits",
                 results.len(),
                 results.iter().map(|r| r.hits.len()).sum::<usize>()
+            );
+        }
+
+        Commands::Update {
+            index,
+            genomes,
+            kmer_size,
+            threads,
+            profile,
+        } => {
+            log::info!("Dragon incremental update");
+
+            let hw = dragon::profile::HardwareProfile::from_name(&profile);
+            hw.log_settings();
+
+            let effective_threads = threads.min(hw.max_threads);
+            let ram_budget = hw.ram_budget();
+
+            let entry = dragon::index::update::add_genomes(
+                &index,
+                &genomes,
+                kmer_size,
+                effective_threads,
+                ram_budget,
+            )?;
+
+            log::info!(
+                "Update complete: overlay '{}' with {} genomes (offset: {})",
+                entry.name,
+                entry.num_genomes,
+                entry.genome_offset
+            );
+        }
+
+        Commands::Compact {
+            index,
+            genomes,
+            kmer_size,
+            threads,
+            profile,
+        } => {
+            log::info!("Dragon index compaction");
+
+            let hw = dragon::profile::HardwareProfile::from_name(&profile);
+            hw.log_settings();
+
+            let effective_threads = threads.min(hw.max_threads);
+            let ram_budget = hw.ram_budget();
+
+            dragon::index::update::compact(
+                &index,
+                &genomes,
+                kmer_size,
+                effective_threads,
+                ram_budget,
+            )?;
+        }
+
+        Commands::Summarize {
+            input,
+            output,
+            format,
+            index,
+            total_genomes,
+        } => {
+            log::info!("Dragon summarize");
+
+            // Determine total genomes in database
+            let db_genomes = if let Some(n) = total_genomes {
+                n
+            } else if let Some(ref idx_dir) = index {
+                let metadata = dragon::index::metadata::load_metadata(idx_dir)?;
+                metadata.num_genomes
+            } else {
+                log::warn!("No --index or --total-genomes provided; prevalence will be reported as 0");
+                0
+            };
+
+            // Read PAF input
+            let records = if input == "-" {
+                let stdin = std::io::stdin();
+                dragon::io::summary::parse_paf(std::io::BufReader::new(stdin.lock()))
+            } else {
+                let file = std::fs::File::open(&input)?;
+                dragon::io::summary::parse_paf(std::io::BufReader::new(file))
+            };
+
+            log::info!("Parsed {} PAF records", records.len());
+
+            // Group records by query
+            let mut query_groups: std::collections::HashMap<String, (usize, Vec<dragon::io::paf::PafRecord>)> =
+                std::collections::HashMap::new();
+            for record in records {
+                let entry = query_groups
+                    .entry(record.query_name.clone())
+                    .or_insert_with(|| (record.query_len, Vec::new()));
+                entry.1.push(record);
+            }
+
+            let query_data: Vec<(String, usize, Vec<dragon::io::paf::PafRecord>)> = query_groups
+                .into_iter()
+                .map(|(name, (len, recs))| (name, len, recs))
+                .collect();
+
+            let report = dragon::io::summary::build_surveillance_report(&query_data, db_genomes);
+
+            // Write output
+            let mut writer: Box<dyn std::io::Write> = if output == "-" {
+                Box::new(std::io::stdout())
+            } else {
+                Box::new(std::fs::File::create(&output)?)
+            };
+
+            match format.as_str() {
+                "tsv" => dragon::io::summary::write_surveillance_tsv(&mut writer, &report)?,
+                "json" => dragon::io::summary::write_surveillance_json(&mut writer, &report)?,
+                _ => anyhow::bail!("Unknown format: {}. Use tsv or json", format),
+            }
+
+            log::info!(
+                "Surveillance report: {} queries, {} species detected",
+                report.total_queries,
+                report.aggregate_species.len()
             );
         }
     }
