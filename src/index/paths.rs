@@ -1,0 +1,252 @@
+/// Genome path index: stores each genome as a sequence of unitig IDs
+/// traversed when walking the genome through the de Bruijn graph.
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::index::unitig::UnitigSet;
+use crate::util::dna;
+
+/// A genome's path through the de Bruijn graph.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenomePath {
+    pub genome_id: u32,
+    pub genome_name: String,
+    pub genome_length: u64,
+    /// Sequence of (unitig_id, is_reverse) pairs.
+    pub steps: Vec<PathStep>,
+}
+
+/// A single step in a genome path.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PathStep {
+    pub unitig_id: u32,
+    pub is_reverse: bool,
+    /// Start position within the genome sequence.
+    pub genome_offset: u64,
+}
+
+/// Collection of all genome paths.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PathIndex {
+    pub paths: Vec<GenomePath>,
+}
+
+impl PathIndex {
+    pub fn get_path(&self, genome_id: u32) -> Option<&GenomePath> {
+        self.paths.get(genome_id as usize)
+    }
+
+    pub fn num_genomes(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Extract the reference sequence for a region of a genome by walking its path.
+    pub fn extract_sequence(
+        &self,
+        genome_id: u32,
+        start: u64,
+        end: u64,
+        unitigs: &UnitigSet,
+    ) -> Vec<u8> {
+        let path = match self.get_path(genome_id) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let mut result = Vec::with_capacity((end - start) as usize);
+
+        for step in &path.steps {
+            let unitig_len = unitigs.unitigs[step.unitig_id as usize].sequence.len as u64;
+            let step_end = step.genome_offset + unitig_len;
+
+            // Check if this step overlaps with the requested region
+            if step.genome_offset >= end || step_end <= start {
+                continue;
+            }
+
+            // Calculate the overlap
+            let overlap_start = start.max(step.genome_offset);
+            let overlap_end = end.min(step_end);
+            let local_start = (overlap_start - step.genome_offset) as usize;
+            let local_end = (overlap_end - step.genome_offset) as usize;
+
+            let mut subseq = unitigs.get_subsequence(step.unitig_id, local_start, local_end);
+
+            if step.is_reverse {
+                // Reverse complement
+                subseq.reverse();
+                for base in &mut subseq {
+                    *base = match *base {
+                        b'A' => b'T',
+                        b'T' => b'A',
+                        b'C' => b'G',
+                        b'G' => b'C',
+                        other => other,
+                    };
+                }
+            }
+
+            result.extend_from_slice(&subseq);
+        }
+
+        result
+    }
+}
+
+/// Build a hash table mapping canonical k-mers to (unitig_id, offset, is_reverse).
+///
+/// For each unitig, slide a k-mer window across the forward strand. Store canonical
+/// k-mer → (unitig_id, offset_in_unitig, is_rc). If a canonical k-mer appears in
+/// multiple unitigs (possible at boundaries), keep the first occurrence — the path
+/// walker will still find contiguous runs.
+fn build_kmer_table(
+    unitigs: &UnitigSet,
+    kmer_size: usize,
+) -> HashMap<u64, (u32, u32, bool)> {
+    let mut table: HashMap<u64, (u32, u32, bool)> = HashMap::new();
+
+    for unitig in &unitigs.unitigs {
+        let seq_len = unitig.sequence.len;
+        if seq_len < kmer_size {
+            continue;
+        }
+
+        for pos in 0..=(seq_len - kmer_size) {
+            let fwd = unitig.sequence.kmer_u64(pos, kmer_size);
+            let canon = dna::canonical_kmer(fwd, kmer_size);
+            let is_rc = canon != fwd;
+
+            // First occurrence wins — avoids expensive overwrite checks
+            table.entry(canon).or_insert((unitig.id, pos as u32, is_rc));
+        }
+    }
+
+    log::info!(
+        "Built k-mer table: {} distinct canonical {}-mers from {} unitigs",
+        table.len(),
+        kmer_size,
+        unitigs.num_unitigs()
+    );
+    table
+}
+
+/// Check if a k-mer window contains ambiguous bases (N).
+#[inline]
+fn has_ambiguous(seq: &[u8], start: usize, k: usize) -> bool {
+    seq[start..start + k].iter().any(|&b| !matches!(b, b'A' | b'a' | b'C' | b'c' | b'G' | b'g' | b'T' | b't'))
+}
+
+/// Build the genome path index by walking each genome through unitig k-mers.
+pub fn build_path_index(
+    genome_dir: &Path,
+    unitigs: &UnitigSet,
+    output_dir: &Path,
+    kmer_size: usize,
+) -> Result<()> {
+    // Step 1: Build canonical k-mer → (unitig_id, offset, is_rc) hash table
+    let kmer_table = build_kmer_table(unitigs, kmer_size);
+
+    // Step 2: Walk each genome and map to unitig path
+    let genome_files = crate::io::fasta::list_fasta_files(genome_dir)?;
+    let mut paths = Vec::with_capacity(genome_files.len());
+    let mut total_steps = 0usize;
+    let mut total_mapped_bases = 0u64;
+    let mut total_genome_bases = 0u64;
+
+    for (genome_id, genome_file) in genome_files.iter().enumerate() {
+        let sequences = crate::io::fasta::read_sequences(genome_file)?;
+        let genome_name = genome_file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let mut genome_offset = 0u64;
+        let mut steps = Vec::new();
+        let mut prev_unitig: Option<(u32, bool)> = None;
+
+        for seq in &sequences {
+            let seq_bytes = &seq.seq;
+            let seq_len = seq_bytes.len();
+            total_genome_bases += seq_len as u64;
+
+            if seq_len < kmer_size {
+                genome_offset += seq_len as u64;
+                continue;
+            }
+
+            for pos in 0..=(seq_len - kmer_size) {
+                // Skip windows with ambiguous bases
+                if has_ambiguous(seq_bytes, pos, kmer_size) {
+                    prev_unitig = None;
+                    continue;
+                }
+
+                // Encode k-mer from raw bytes
+                let packed = dna::PackedSequence::from_bytes(&seq_bytes[pos..pos + kmer_size]);
+                let fwd = packed.kmer_u64(0, kmer_size);
+                let canon = dna::canonical_kmer(fwd, kmer_size);
+
+                if let Some(&(unitig_id, _offset, kmer_is_rc)) = kmer_table.get(&canon) {
+                    // Determine orientation: if the genome k-mer's canonical form
+                    // required RC, and the unitig's stored k-mer also required RC,
+                    // they cancel out → forward. Otherwise they differ → reverse.
+                    let genome_is_rc = canon != fwd;
+                    let is_reverse = genome_is_rc != kmer_is_rc;
+
+                    // Emit a new step only on unitig transitions
+                    let current = (unitig_id, is_reverse);
+                    if prev_unitig != Some(current) {
+                        steps.push(PathStep {
+                            unitig_id,
+                            is_reverse,
+                            genome_offset: genome_offset + pos as u64,
+                        });
+                        prev_unitig = Some(current);
+                        total_mapped_bases += unitigs.unitigs[unitig_id as usize].sequence.len as u64;
+                    }
+                } else {
+                    // k-mer not found in any unitig — break the chain
+                    prev_unitig = None;
+                }
+            }
+
+            genome_offset += seq_len as u64;
+        }
+
+        total_steps += steps.len();
+
+        paths.push(GenomePath {
+            genome_id: genome_id as u32,
+            genome_name,
+            genome_length: genome_offset,
+            steps,
+        });
+    }
+
+    let path_index = PathIndex { paths };
+    let path_file = output_dir.join("paths.bin");
+    crate::util::mmap::write_bincode(&path_file, &path_index)?;
+
+    log::info!(
+        "Path index: {} genomes, {} total steps, {:.1}% bases mapped",
+        path_index.num_genomes(),
+        total_steps,
+        if total_genome_bases > 0 {
+            total_mapped_bases as f64 / total_genome_bases as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    log::info!("Path index saved to {:?}", path_file);
+    Ok(())
+}
+
+/// Load the path index from disk.
+pub fn load_path_index(index_dir: &Path) -> Result<PathIndex> {
+    let path_file = index_dir.join("paths.bin");
+    crate::util::mmap::read_bincode(&path_file)
+}

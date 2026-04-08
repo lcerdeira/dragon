@@ -1,0 +1,46 @@
+[package]
+name = "dragon"
+version = "0.1.0"
+edition = "2021"
+authors = ["Dragon Contributors"]
+description = "Resource-efficient sequence alignment against millions of prokaryotic genomes"
+license = "MIT"
+repository = "https://github.com/dragon-aligner/dragon"
+
+[dependencies]
+# Core bioinformatics
+fm-index = "0.2"
+roaring = "0.10"
+bio = "2"
+
+# Note: sux crate removed due to build issues with common_traits on Rust 1.94+
+# Elias-Fano is implemented internally in ds/elias_fano.rs
+
+# Infrastructure
+memmap2 = "0.9"
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# Compression
+lz4_flex = "0.11"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+serde_json = "1"
+
+# Progress
+indicatif = "0.17"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+rand = "0.8"
+
+[[bench]]
+name = "benchmark"
+harness = false
