@@ -14,10 +14,10 @@
 
 set -euo pipefail
 
-DRAGON="$HOME/Dragon/target/release/dragon"
-WORKSPACE="$HOME/dragon_workspace"
+DRAGON="${DRAGON:-$HOME/Dragon/target/release/dragon}"
+INDEX_DIR="${1:-$HOME/dragon_index}"
+WORKSPACE="$(dirname "$INDEX_DIR")/gtdb_workspace"
 GENOME_DIR="$WORKSPACE/genomes"
-INDEX_DIR="$HOME/dragon_index"
 
 # System info
 echo "====================================="
