@@ -1,6 +1,8 @@
 pub mod align;
 pub mod candidate;
 pub mod chain;
+pub mod containment;
+pub mod direct_align;
 pub mod extract;
 pub mod ml_score;
 pub mod seed;
@@ -79,7 +81,7 @@ pub fn search(
     let fm_index = crate::index::fm::load_fm_index(&config.index_dir)?;
     let color_index = crate::index::color::load_color_index(&config.index_dir)?;
     let path_index = crate::index::paths::load_path_index(&config.index_dir)?;
-    let specificity_index = crate::index::specificity::SpecificityIndex::load_or_build(
+    let _specificity_index = crate::index::specificity::SpecificityIndex::load_or_build(
         &config.index_dir,
         &color_index,
     ).ok();
@@ -90,7 +92,7 @@ pub fn search(
     let unitigs = crate::index::unitig::UnitigSet::from_fm_text(&fm_index.text, &unitig_lengths);
 
     // Initialize ML seed scorer (unless disabled)
-    let scorer = if config.no_ml {
+    let _scorer = if config.no_ml {
         log::info!("ML seed scoring disabled (--no-ml)");
         None
     } else if let Some(ref weights_path) = config.ml_weights_path {
@@ -128,7 +130,7 @@ pub fn search(
 
         // Adaptive vote threshold: lower for short reads and small seed sets
         let base_min_votes = if query.seq.len() < 300 { 2u32 } else { 10u32 };
-        let effective_chain_score = if query.seq.len() < 300 {
+        let _effective_chain_score = if query.seq.len() < 300 {
             config.min_chain_score.min(20.0)
         } else {
             config.min_chain_score
@@ -190,48 +192,28 @@ pub fn search(
             }
         }
 
-        // Stage 3: Colinear chaining per candidate genome (with ML seed scoring)
-        let mut chains = chain::chain_candidates_with_query_len(
-            &seeds,
-            &candidates,
-            &path_index,
-            effective_chain_score,
-            query.seq.len(),
-            scorer.as_ref(),
-            &color_index,
+        // Stage 3: Containment-based ranking (primary method)
+        // Computes k-mer containment between query and each genome via color index.
+        // This bypasses the unitig-boundary seeding problem by counting ALL k-mer
+        // matches, not just those within single unitigs.
+        let containment_hits = containment::containment_rank(
             &query.seq,
+            &fm_index,
+            &color_index,
+            config.min_seed_len.min(31), // Use k for containment counting
+            config.max_seed_freq,
         );
 
-        // Stage 3b: Specificity-boosted re-ranking
-        // Boost chains that contain genome-specific unitigs. This helps
-        // discriminate within-species (e.g., 50 E. coli that share most k-mers
-        // but differ in their private unitig hits).
-        if let Some(ref spec_index) = specificity_index {
-            // Collect all hit unitig IDs from seeds for this query
-            let mut hit_unitigs = roaring::RoaringBitmap::new();
-            for seed in &seeds {
-                hit_unitigs.insert(seed.unitig_id);
-            }
-
-            // Re-sort chains by combined score: containment + specificity bonus
-            chains.sort_by(|a, b| {
-                let a_match: usize = a.anchors.iter().map(|anc| anc.match_len).sum();
-                let b_match: usize = b.anchors.iter().map(|anc| anc.match_len).sum();
-                let a_spec = spec_index.specificity_score(a.genome_id, &hit_unitigs);
-                let b_spec = spec_index.specificity_score(b.genome_id, &hit_unitigs);
-                // Combined score: containment (matching bases) + specificity bonus
-                let a_combined = a_match as f64 + a_spec;
-                let b_combined = b_match as f64 + b_spec;
-                b_combined.partial_cmp(&a_combined).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-
-        // Stage 4: Extract reference and align
-        let mut alignments = align::align_chains(
+        // Stage 4: Direct alignment against top candidates
+        // Extracts actual genome sequences and aligns directly, bypassing
+        // the lossy unitig→path→coordinate mapping.
+        let mut alignments = direct_align::direct_align_candidates(
             &query.seq,
-            &chains,
+            &query.name,
+            &containment_hits,
             &path_index,
             &unitigs,
+            config.max_target_seqs,
         );
 
         // Stage 5: Post-alignment filtering — this is critical for precision

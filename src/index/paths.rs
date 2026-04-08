@@ -94,6 +94,49 @@ impl PathIndex {
 
         result
     }
+
+    /// Extract sequence from a GenomePath directly (no PathIndex lookup needed).
+    pub fn extract_sequence_static(
+        path: &GenomePath,
+        start: u64,
+        end: u64,
+        unitigs: &UnitigSet,
+    ) -> Vec<u8> {
+        let mut result = Vec::with_capacity((end - start) as usize);
+
+        for step in &path.steps {
+            let unitig_len = unitigs.unitigs.get(step.unitig_id as usize)
+                .map(|u| u.sequence.len as u64)
+                .unwrap_or(0);
+            let step_end = step.genome_offset + unitig_len;
+
+            if step.genome_offset >= end || step_end <= start {
+                continue;
+            }
+
+            let overlap_start = start.max(step.genome_offset);
+            let overlap_end = end.min(step_end);
+            let local_start = (overlap_start - step.genome_offset) as usize;
+            let local_end = (overlap_end - step.genome_offset) as usize;
+
+            let mut subseq = unitigs.get_subsequence(step.unitig_id, local_start, local_end);
+
+            if step.is_reverse {
+                subseq.reverse();
+                for base in &mut subseq {
+                    *base = match *base {
+                        b'A' => b'T', b'T' => b'A',
+                        b'C' => b'G', b'G' => b'C',
+                        other => other,
+                    };
+                }
+            }
+
+            result.extend_from_slice(&subseq);
+        }
+
+        result
+    }
 }
 
 /// Build a hash table mapping canonical k-mers to (unitig_id, offset, is_reverse).
