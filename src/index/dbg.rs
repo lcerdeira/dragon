@@ -56,7 +56,6 @@ fn build_with_ggcat(
     num_genomes: usize,
 ) -> Result<DbgResult> {
     let unitig_file = output_dir.join("unitigs.fa");
-    let color_file = output_dir.join("colors.jsonl");
 
     // Create input file list
     let file_list = output_dir.join("input_files.txt");
@@ -68,6 +67,10 @@ fn build_with_ggcat(
         .join("\n");
     std::fs::write(&file_list, file_list_content)?;
 
+    // Use output_dir for GGCAT temp files to avoid filling the root disk
+    let temp_dir = output_dir.join(".ggcat_temp");
+    std::fs::create_dir_all(&temp_dir)?;
+
     let status = std::process::Command::new("ggcat")
         .args([
             "build",
@@ -76,6 +79,8 @@ fn build_with_ggcat(
             "-j",
             &threads.to_string(),
             "--colors",
+            "--temp-dir",
+            &temp_dir.to_string_lossy(),
             "-l",
             &file_list.to_string_lossy(),
             "-o",
@@ -84,8 +89,45 @@ fn build_with_ggcat(
         .status()
         .context("Failed to run GGCAT")?;
 
+    // Clean up GGCAT temp files
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
     if !status.success() {
         anyhow::bail!("GGCAT exited with non-zero status: {}", status);
+    }
+
+    // GGCAT v2 embeds colors in FASTA headers: >unitig_id LN:i:len C:genome:count ...
+    // Convert to TSV format that Dragon's color index builder expects.
+    log::info!("Parsing GGCAT color annotations from unitig headers...");
+    let color_file = output_dir.join("colors.tsv");
+    {
+        use std::io::{BufRead, Write};
+        let reader = std::io::BufReader::new(std::fs::File::open(&unitig_file)?);
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&color_file)?);
+
+        for line in reader.lines() {
+            let line = line?;
+            if !line.starts_with('>') {
+                continue;
+            }
+            // Parse: >unitig_id [LN:i:len] [C:genome_id:count] ...
+            let parts: Vec<&str> = line[1..].split_whitespace().collect();
+            let unitig_id = parts.first().unwrap_or(&"0");
+            let mut genome_ids: Vec<String> = Vec::new();
+            for part in &parts[1..] {
+                if let Some(rest) = part.strip_prefix("C:") {
+                    // C:genome_id:count
+                    if let Some(gid) = rest.split(':').next() {
+                        genome_ids.push(gid.to_string());
+                    }
+                }
+            }
+            if !genome_ids.is_empty() {
+                writeln!(writer, "{}\t{}", unitig_id, genome_ids.join(","))?;
+            } else {
+                writeln!(writer, "{}\t", unitig_id)?;
+            }
+        }
     }
 
     // Count unitigs
