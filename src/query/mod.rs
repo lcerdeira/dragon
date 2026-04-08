@@ -126,8 +126,8 @@ pub fn search(
     for query in &queries {
         log::debug!("Searching query: {} ({} bp)", query.name, query.seq.len());
 
-        // Adaptive parameters for short reads
-        let min_votes = if query.seq.len() < 300 { 2 } else { 10 };
+        // Adaptive vote threshold: lower for short reads and small seed sets
+        let base_min_votes = if query.seq.len() < 300 { 2u32 } else { 10u32 };
         let effective_chain_score = if query.seq.len() < 300 {
             config.min_chain_score.min(20.0)
         } else {
@@ -143,6 +143,12 @@ pub fn search(
         );
 
         // Stage 2: Identify candidate genomes via color voting
+        // Adaptive threshold: use at most 20% of seed count, but at least 2
+        let min_votes = if seeds.is_empty() {
+            base_min_votes
+        } else {
+            base_min_votes.min((seeds.len() as u32 / 5).max(2))
+        };
         let candidates = candidate::find_candidates(&seeds, &color_index, min_votes);
 
         // Dump seeds with full ML features if requested (for training data generation)
