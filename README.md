@@ -1,6 +1,10 @@
-# Dragon
+<p align="center">
+  <img src="assets/dragon-logo.png" alt="Dragon Logo" width="300">
+</p>
 
-**Resource-efficient sequence alignment against millions of prokaryotic genomes using graph-based compressed indexing**
+<h1 align="center">Dragon</h1>
+
+<p align="center"><strong>Resource-efficient sequence alignment against millions of prokaryotic genomes using graph-based compressed indexing</strong></p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
