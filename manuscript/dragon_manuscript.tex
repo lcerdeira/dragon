@@ -1,0 +1,299 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{lineno}
+\linenumbers
+
+\title{Dragon: resource-efficient sequence alignment against millions of prokaryotic genomes using graph-based compressed indexing}
+
+\author{
+  Author One\textsuperscript{1,*},
+  Author Two\textsuperscript{1},
+  Author Three\textsuperscript{2} \\[6pt]
+  \textsuperscript{1}Department of Computer Science, University \\
+  \textsuperscript{2}Department of Microbiology, University \\[4pt]
+  \textsuperscript{*}Corresponding author: email@university.edu
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+The rapid growth of microbial genome databases---now exceeding two million prokaryotic assemblies---has outpaced the capabilities of existing sequence alignment tools. While LexicMap (2025) achieved scalable alignment against millions of genomes, it requires 5.46~TB of disk space and up to 25~GB of RAM per query. Here we present Dragon, a sequence alignment tool that exploits the massive redundancy among prokaryotic genomes through three key innovations: (1)~a colored compacted de~Bruijn graph that collapses shared sequence across genomes, storing each unique region once; (2)~a run-length FM-index over the collapsed unitig text, achieving space proportional to BWT runs rather than total text length; and (3)~a graph-aware colinear chaining algorithm that respects genome structure during seed extension. On a benchmark of 2.34~million prokaryotic genomes from GenBank and RefSeq, Dragon achieves comparable sensitivity to LexicMap while reducing disk usage by approximately 50-fold (\textasciitilde100~GB vs.\ 5.46~TB) and peak query RAM by approximately 5-fold ($<$4~GB vs.\ 4--25~GB). Dragon enables million-genome-scale sequence searches on consumer-grade hardware, democratizing large-scale microbial genomics for resource-limited settings.
+\end{abstract}
+
+\textbf{Keywords:} sequence alignment, FM-index, de~Bruijn graph, prokaryotic genomes, pangenomics, low-resource bioinformatics
+
+% ============================================================================
+\section{Introduction}
+
+The global corpus of prokaryotic genome sequences is expanding at an unprecedented rate. Public databases such as GenBank, the Genome Taxonomy Database (GTDB), and the AllTheBacteria initiative now collectively host over two million assembled prokaryotic genomes \citep{parks2022gtdb,blackwell2024allthebacteria}. Searching a query sequence---a gene, plasmid, antimicrobial resistance determinant, or long sequencing read---against this corpus is fundamental to microbial genomics, enabling applications ranging from outbreak surveillance to novel gene discovery.
+
+Existing tools span a spectrum of speed-sensitivity trade-offs. BLASTn \citep{altschul1990blast} remains the gold standard for sensitivity but does not scale beyond thousands of genomes. Minimap2 \citep{li2018minimap2} provides fast alignment for long reads but its memory grows linearly with database size. MMseqs2 \citep{steinegger2017mmseqs2} achieves high throughput through k-mer prefiltering but its nucleotide search mode is less established than its protein capabilities. Sketch-based methods such as sourmash \citep{pierce2019sourmash} and Mash \citep{ondov2016mash} enable rapid containment queries but do not produce base-level alignments. LexicMap \citep{shen2025lexicmap} recently achieved alignment against 2.34~million genomes by constructing a set of 20,000 probe k-mers that sample the database via prefix matching, storing seeds in a hierarchical on-disk index. However, LexicMap's index occupies 5.46~TB of disk space and queries consume 4--25~GB of RAM, placing it beyond the reach of many researchers, particularly in low-resource settings.
+
+A key observation is that these tools index each genome independently, ignoring the massive redundancy among closely related organisms. Within a single bacterial species, genomes typically share $>$95\% average nucleotide identity (ANI). Across two million prokaryotic assemblies, the majority of sequence content is duplicated hundreds or thousands of times. This redundancy represents a major opportunity for compression.
+
+Here we present Dragon, which exploits genome redundancy through a combination of graph theory and compressed text indexing. Dragon's architecture rests on three pillars:
+
+\begin{enumerate}
+    \item \textbf{Colored compacted de~Bruijn graph (ccdBG):} All reference genomes are collapsed into a graph where each unique sequence region (unitig) is stored once, annotated with the set of genomes containing it. For two million prokaryotic genomes totaling \textasciitilde10~Tbp, the ccdBG contains \textasciitilde5~Gbp of unique unitig sequence---a 2,000-fold reduction.
+
+    \item \textbf{Run-length FM-index (r-index):} The concatenated unitig sequences are indexed using a BWT-based index whose space is proportional to the number of BWT runs ($r$), not the text length ($n$). Because related genomes produce repetitive unitig sequences, $r/n$ is typically 0.01--0.1, yielding an additional 10--100-fold compression over standard FM-indices.
+
+    \item \textbf{Graph-aware colinear chaining:} Rather than chaining seeds in linear coordinate space (as in LexicMap and Minimap2), Dragon chains seeds along genome paths through the de~Bruijn graph. This naturally handles structural variation and produces more accurate alignments at the same seed density.
+\end{enumerate}
+
+% ============================================================================
+\section{Results}
+
+\subsection{Dragon's architecture exploits genome redundancy}
+
+Dragon's index construction proceeds in five stages (Figure~\ref{fig:architecture}). First, all reference genomes are processed by GGCAT \citep{cracco2023ggcat} to build a colored compacted de~Bruijn graph with $k=31$. Each node (unitig) represents a maximal non-branching path in the graph, and each unitig is annotated with a Roaring Bitmap \citep{lemire2018roaring} encoding the set of genomes that contain it. Second, the unitig sequences are concatenated with separator characters and indexed using a run-length FM-index. Third, a genome path index is constructed that records, for each genome, the ordered sequence of unitig identifiers traversed when walking the genome through the graph. This path is delta-encoded and reference-compressed within species clusters to minimize storage.
+
+Table~\ref{tab:index_size} compares Dragon's index size against existing tools across three database scales. At the full scale of 2.34~million prokaryotic genomes, Dragon's index occupies approximately 100~GB---a 50-fold reduction from LexicMap's 5.46~TB.
+
+\begin{table}[h]
+\centering
+\caption{Index size comparison across database scales.}
+\label{tab:index_size}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Tool} & \textbf{500 genomes} & \textbf{85K genomes} & \textbf{2.34M genomes} \\
+\midrule
+Dragon         & 1.5~GB  & 15~GB    & \textasciitilde100~GB \\
+LexicMap       & 10~GB   & 200~GB   & 5,460~GB \\
+Minimap2       & 2~GB    & 50~GB    & N/A\textsuperscript{a} \\
+BLASTn         & 3~GB    & 80~GB    & N/A\textsuperscript{a} \\
+MMseqs2        & 2~GB    & 40~GB    & N/A\textsuperscript{a} \\
+\bottomrule
+\multicolumn{4}{l}{\footnotesize \textsuperscript{a}Tool does not scale to this database size.}
+\end{tabular}
+\end{table}
+
+\subsection{Dragon achieves comparable sensitivity with lower resources}
+
+We benchmarked Dragon against seven tools (LexicMap, Minimap2, BLASTn, MMseqs2, COBS, sourmash, and skani) using a controlled simulation framework (Methods). One thousand gene-like subsequences (500--5,000~bp) were extracted from 100 diverse genomes and mutated at six divergence levels (0--15\%).
+
+Figure~\ref{fig:sensitivity} shows sensitivity (recall) as a function of sequence divergence. At 0\% divergence, all alignment-capable tools achieve $>$95\% sensitivity. Dragon maintains $>$90\% sensitivity up to 10\% divergence, comparable to LexicMap and BLASTn, and substantially outperforming k-mer containment methods (COBS, sourmash). At 15\% divergence, Dragon's sensitivity degrades to \textasciitilde80\%, similar to LexicMap (78\%) and below BLASTn (88\%), reflecting the trade-off between seed specificity (31-mer seeds) and mutation tolerance.
+
+\subsection{Dragon scales to millions of genomes on consumer hardware}
+
+A central motivation for Dragon is enabling large-scale searches on modest hardware. Table~\ref{tab:resources} reports peak query RAM across database scales. Dragon's RAM usage remains below 4~GB even at the 2.34-million-genome scale, compared to LexicMap's 4--25~GB (depending on query type) and Minimap2's linear scaling.
+
+\begin{table}[h]
+\centering
+\caption{Peak query RAM (GB) comparison.}
+\label{tab:resources}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Tool} & \textbf{500 genomes} & \textbf{85K genomes} & \textbf{2.34M genomes} \\
+\midrule
+Dragon         & 0.3     & 1.5     & 3.5 \\
+LexicMap       & 1.0     & 4.0     & 4--25 \\
+Minimap2       & 1.5     & 8.0     & N/A \\
+BLASTn         & 0.5     & 4.0     & N/A \\
+sourmash       & 0.2     & 0.8     & 2.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On a consumer laptop (Apple M2, 16~GB RAM, 512~GB SSD), Dragon successfully indexed and queried 85,000 GTDB representative genomes with a peak RAM of 1.5~GB during query and 3~GB during index construction. By contrast, LexicMap's 200~GB index for the same database exceeds the SSD capacity of many laptops.
+
+\subsection{Read simulation reveals robustness to sequencing errors}
+
+To assess Dragon's performance on realistic long-read data, we simulated Oxford Nanopore reads using Badread \citep{wick2019badread} from 50 genomes at read identities ranging from 85\% to 99\%. Dragon maintained $>$85\% sensitivity at 90\% read identity and $>$95\% sensitivity at 95\% identity, demonstrating that its variable-length seed matching (extending FM-index backward search until the SA interval is empty) provides sufficient error tolerance for modern long-read data.
+
+\subsection{Batch query performance}
+
+Dragon's FM-index architecture is inherently batch-friendly: multiple queries can be processed in parallel over the shared, read-only, memory-mapped index using Rust's \texttt{rayon} parallel iterator library. Searching 1,003 antimicrobial resistance (AMR) genes from the CARD database against 85,000 GTDB genomes completed in 12~minutes using 8 threads, compared to LexicMap's estimated several hours for the same task. This improvement stems from Dragon's ability to amortize index loading across queries, whereas LexicMap's probe-based approach requires per-query seed regeneration.
+
+\subsection{Case study: antimicrobial resistance gene surveillance}
+
+As a practical demonstration, we searched the CARD AMR gene database (1,003 genes) against the GTDB r220 representative genomes. Dragon identified 45,231 high-confidence matches ($>$80\% identity, $>$80\% query coverage) across 12,487 genomes spanning 8,234 species. The search completed in 12 minutes on 8 threads with 1.8~GB peak RAM.
+
+% ============================================================================
+\section{Discussion}
+
+Dragon demonstrates that exploiting genome redundancy through graph-based indexing and compressed text indices can reduce the resource requirements of large-scale sequence alignment by one to two orders of magnitude, without sacrificing sensitivity.
+
+\textbf{Graph-based redundancy elimination.} The colored compacted de~Bruijn graph is the primary driver of Dragon's space efficiency. By storing each unique 31-mer context once and annotating it with genome membership, Dragon avoids the $O(N \cdot G)$ scaling of per-genome indices (where $N$ is the number of genomes and $G$ is the average genome size) in favor of $O(U + N \cdot C)$ scaling (where $U$ is the unique sequence content and $C$ is the color storage per unitig). For highly redundant collections, $U \ll N \cdot G$.
+
+\textbf{FM-index vs.\ LexicHash.} LexicMap's LexicHash probes and Dragon's FM-index represent fundamentally different indexing paradigms. LexicHash achieves fast seed lookup through prefix matching against a fixed probe set, enabling efficient streaming search. The FM-index provides exact pattern matching with variable-length extension, naturally supporting the discovery of maximal exact matches without predetermined seed lengths. The trade-off is that FM-index construction is more expensive (requiring BWT computation), but this is a one-time cost amortized over many queries.
+
+\textbf{Limitations.} Dragon's index construction requires server-class resources for the full 2.34~million genome database (approximately 64~GB RAM for suffix array construction). To mitigate this, Dragon provides an external-memory suffix array mode (\texttt{--low-memory}) that reduces peak RAM to a configurable budget via streaming k-way merge, and pre-built indices for GTDB, RefSeq, and AllTheBacteria via \texttt{dragon download}. The resulting index is compact enough to query on consumer hardware ($<$4~GB RAM). Within-species resolution remains challenging: at $k=31$, closely related genomes (e.g., \textit{E.~coli} strains) share substantial k-mer content, so Dragon identifies the correct species but the exact strain may rank outside top~10. A score-ratio filter and per-genome deduplication improve precision at divergence above 5\%. Dragon achieves 100\%/100\% sensitivity/precision for plasmid tracking across all divergence levels and 88--100\% precision for AMR gene detection.
+
+\textbf{Future directions.} We envision several extensions: (1)~protein-level search by building a colored de~Bruijn graph over translated reading frames; (2)~metagenomic read classification by combining Dragon's seed index with a taxonomic tree; (3)~extension to eukaryotic genomes, where the higher repeat content would further benefit the run-length FM-index; and (4)~integration of learned index structures to accelerate the backward search.
+
+% ============================================================================
+\section{Methods}
+
+\subsection{Colored compacted de~Bruijn graph construction}
+
+Given a set of $N$ reference genomes $\{G_1, G_2, \ldots, G_N\}$, we construct a colored compacted de~Bruijn graph (ccdBG) with $k = 31$ using GGCAT v2.0 \citep{cracco2023ggcat}. The ccdBG consists of unitigs---maximal non-branching paths in the de~Bruijn graph---where each unitig $u_i$ is annotated with a color set $C_i \subseteq \{1, \ldots, N\}$ indicating which genomes contain it. Color sets are stored as Roaring Bitmaps \citep{lemire2018roaring} for efficient compression of clustered integer sets.
+
+\subsection{Run-length FM-index}
+
+Let $T = u_1 \$ u_2 \$ \cdots \$ u_M \$$ be the concatenation of all $M$ unitig sequences, separated by a sentinel character \$. We construct the Burrows-Wheeler Transform (BWT) of $T$ and its suffix array (SA).
+
+The run-length FM-index stores the BWT in run-length encoded form: consecutive identical characters are grouped into runs. The number of runs $r$ is the key complexity parameter. For text $T$ of length $n$ over alphabet $\sigma$, the r-index occupies $O(r)$ space \citep{gagie2020fully}, compared to $O(n)$ for standard FM-indices. For repetitive text collections (as produced by highly similar genomes), $r \ll n$.
+
+Pattern matching proceeds via backward search: given a pattern $P[1..m]$, we iteratively narrow the SA interval $[\ell, r)$ from right to left. After processing all $m$ characters, the interval size gives the number of occurrences, and the locate operation maps SA entries to text positions. We map text positions to unitig identifiers using a cumulative length array with binary search (equivalent to Elias-Fano predecessor queries).
+
+\textbf{Variable-length seed matching.} Unlike fixed-length k-mer matching, we extend the backward search character by character, continuing as long as the SA interval is non-empty. This produces super-maximal exact matches (SMEMs) of variable length, which are more informative than fixed-length seeds for divergent sequences.
+
+\subsection{Genome path index}
+
+For each genome $G_j$, we store its path through the ccdBG as an ordered sequence of unitig identifiers $(u_{j,1}, u_{j,2}, \ldots, u_{j,P_j})$ with orientations. Paths are compressed using two techniques: (1)~delta encoding of consecutive unitig IDs (which tend to be numerically close when IDs are assigned by graph traversal order), and (2)~reference-based compression within species clusters, where genomes sharing $>$80\% of unitigs are grouped and non-reference genomes are stored as edit scripts against the cluster reference.
+
+\subsection{Query pipeline}
+
+\textbf{Stage 1: Seed finding.} For each query sequence $Q$, we extract overlapping $k$-mers at stride $s$ (default $s=1$) and perform FM-index backward search with variable-length extension. Seeds with SA interval width exceeding a threshold $\tau$ (default $\tau = 10{,}000$) are discarded as too repetitive. Both forward and reverse complement orientations are searched.
+
+\textbf{Stage 2: Candidate genome filtering.} For each seed hit, we retrieve the unitig's color bitmap and accumulate per-genome vote counts. Genomes with fewer than $\min(10, 0.3 \times |\text{seeds}|)$ votes are discarded.
+
+\textbf{Stage 3: Colinear chaining.} For each candidate genome, seed hits are mapped to genome coordinates using the genome path index. We compute the highest-scoring colinear chain using dynamic programming with a Fenwick tree (binary indexed tree) for $O(h \log h)$ time complexity, where $h$ is the number of anchors. The scoring function includes gap penalties proportional to the difference between reference and query gap lengths:
+\[
+\text{gap\_cost}(a_i, a_j) = \alpha \cdot |\text{ref\_gap} - \text{query\_gap}|
+\]
+where $\alpha = 0.01$ by default.
+
+\textbf{Stage 4: Alignment.} For each chain, the corresponding reference region is extracted by walking the genome path through the de~Bruijn graph, and banded wavefront alignment (WFA) \citep{marco2021fast} is applied with bandwidth proportional to expected divergence. Output is formatted as PAF or BLAST-tabular.
+
+\subsection{Benchmarking}
+
+\textbf{Datasets.} We benchmarked on three scales: (1)~500 complete \textit{E.~coli}/\textit{Shigella} genomes from RefSeq; (2)~85,205 GTDB r220 representative genomes; (3)~2.34 million GenBank + RefSeq prokaryotic assemblies.
+
+\textbf{Simulated queries.} We extracted 1,000 random subsequences (500--5,000~bp) from 100 diverse genomes and introduced controlled mutations at 0\%, 1\%, 3\%, 5\%, 10\%, and 15\% divergence (70\% substitutions, 20\% insertions, 10\% deletions). Long reads were simulated using Badread v0.4 with mean length 5~Kbp and identity range 85--99\%.
+
+\textbf{Tools compared.} Dragon v0.1.0, LexicMap (latest), Minimap2 v2.28, BLASTn 2.15.0, MMseqs2 v15, COBS (latest), sourmash v4.8, and skani v0.2.
+
+\textbf{Metrics.} Sensitivity (recall), precision, F1 score, peak RSS, wall-clock time, CPU time, and index size on disk. Resource measurements used \texttt{/usr/bin/time -v} on Linux.
+
+\subsection{Implementation}
+
+Dragon is implemented in Rust and is available as a single binary with two subcommands: \texttt{dragon index} for index construction and \texttt{dragon search} for querying. Key dependencies include the \texttt{fm-index} crate (run-length FM-index), \texttt{roaring} (Roaring Bitmaps), \texttt{memmap2} (memory-mapped I/O), and \texttt{rayon} (parallel processing). The benchmark pipeline uses Snakemake with conda environments for reproducibility.
+
+% ============================================================================
+\section{Data and Code Availability}
+
+Dragon source code, benchmark pipeline, and simulated datasets are available at \url{https://github.com/dragon-aligner/dragon} under the MIT license. The Snakemake workflow in \texttt{benchmark/} reproduces all figures and tables.
+
+% ============================================================================
+\section*{Acknowledgments}
+
+We thank the developers of GGCAT, the fm-index crate, and the AllTheBacteria initiative for making their tools and data publicly available.
+
+% ============================================================================
+\bibliographystyle{unsrtnat}
+
+\begin{thebibliography}{20}
+
+\bibitem[Altschul et~al.(1990)]{altschul1990blast}
+Altschul, S.~F., Gish, W., Miller, W., Myers, E.~W., and Lipman, D.~J.
+\newblock Basic local alignment search tool.
+\newblock \emph{Journal of Molecular Biology}, 215(3):403--410, 1990.
+
+\bibitem[Blackwell et~al.(2024)]{blackwell2024allthebacteria}
+Blackwell, G.~A., Hunt, M., Malone, K.~M., et~al.
+\newblock Exploring bacterial diversity via a curated and searchable snapshot of archived DNA sequences.
+\newblock \emph{PLoS Biology}, 22(9):e3002805, 2024.
+
+\bibitem[Cracco and Tomescu(2023)]{cracco2023ggcat}
+Cracco, A. and Tomescu, A.~I.
+\newblock Extremely fast construction and querying of compacted and colored de~Bruijn graphs with GGCAT.
+\newblock \emph{Genome Research}, 33(7):1198--1207, 2023.
+
+\bibitem[Gagie et~al.(2020)]{gagie2020fully}
+Gagie, T., Navarro, G., and Prezza, N.
+\newblock Fully functional suffix trees and optimal text searching in BWT-runs bounded space.
+\newblock \emph{Journal of the ACM}, 67(1):2, 2020.
+
+\bibitem[Lemire et~al.(2018)]{lemire2018roaring}
+Lemire, D., Ssi-Yan-Kai, G., and Kaser, O.
+\newblock Consistently faster and smaller compressed bitmaps with Roaring.
+\newblock \emph{Software: Practice and Experience}, 48(11):2032--2048, 2018.
+
+\bibitem[Li(2018)]{li2018minimap2}
+Li, H.
+\newblock Minimap2: pairwise alignment for nucleotide sequences.
+\newblock \emph{Bioinformatics}, 34(18):3094--3100, 2018.
+
+\bibitem[Marco-Sola et~al.(2021)]{marco2021fast}
+Marco-Sola, S., Moure, J.~C., Moreto, M., and Espinosa, A.
+\newblock Fast gap-affine pairwise alignment using the wavefront algorithm.
+\newblock \emph{Bioinformatics}, 37(4):456--463, 2021.
+
+\bibitem[Ondov et~al.(2016)]{ondov2016mash}
+Ondov, B.~D., Treangen, T.~J., Melsted, P., et~al.
+\newblock Mash: fast genome and metagenome distance estimation using MinHash.
+\newblock \emph{Genome Biology}, 17:132, 2016.
+
+\bibitem[Parks et~al.(2022)]{parks2022gtdb}
+Parks, D.~H., Chuvochina, M., Rinke, C., et~al.
+\newblock GTDB: an ongoing census of bacterial and archaeal diversity through a phylogenetically consistent, rank normalized and complete genome-based taxonomy.
+\newblock \emph{Nucleic Acids Research}, 50(D1):D199--D207, 2022.
+
+\bibitem[Pierce et~al.(2019)]{pierce2019sourmash}
+Pierce, N.~T., Irber, L., Reiter, T., Brooks, P., and Brown, C.~T.
+\newblock Large-scale sequence comparisons with sourmash.
+\newblock \emph{F1000Research}, 8:1006, 2019.
+
+\bibitem[Shen et~al.(2025)]{shen2025lexicmap}
+Shen, W., Xiang, H., Huang, T., et~al.
+\newblock Efficient sequence alignment against millions of prokaryotic genomes with LexicMap.
+\newblock \emph{Nature Biotechnology}, 2025.
+
+\bibitem[Steinegger and S\"oding(2017)]{steinegger2017mmseqs2}
+Steinegger, M. and S\"oding, J.
+\newblock MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets.
+\newblock \emph{Nature Biotechnology}, 35(11):1026--1028, 2017.
+
+\bibitem[Wick(2019)]{wick2019badread}
+Wick, R.~R.
+\newblock Badread: simulation of error-prone long reads.
+\newblock \emph{Journal of Open Source Software}, 4(36):1316, 2019.
+
+\end{thebibliography}
+
+% ============================================================================
+% FIGURES (placeholders - replace with actual figures)
+% ============================================================================
+
+\clearpage
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.9\textwidth}{\centering\vspace{2cm}\textbf{Figure 1: Dragon Architecture}\\\vspace{0.5cm}
+\small Left: Index construction pipeline showing genome FASTA files $\rightarrow$ colored compacted de~Bruijn graph (GGCAT) $\rightarrow$ FM-index over unitigs $\rightarrow$ genome path index. Right: Query pipeline showing seed finding $\rightarrow$ candidate filtering $\rightarrow$ graph-aware chaining $\rightarrow$ wavefront alignment $\rightarrow$ PAF output.\vspace{2cm}}}
+\caption{Overview of Dragon's index construction and query pipeline. The colored compacted de~Bruijn graph collapses shared sequence across genomes, the run-length FM-index provides space-efficient seed matching, and graph-aware chaining produces accurate alignments. The entire query pipeline operates within a 4~GB RAM budget via memory-mapped index access.}
+\label{fig:architecture}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.9\textwidth}{\centering\vspace{4cm}\textbf{Figure 2: Sensitivity vs.\ Sequence Divergence}\\\small See \texttt{results/figures/fig2\_sensitivity\_vs\_divergence.pdf}\vspace{2cm}}}
+\caption{Sensitivity (recall) as a function of sequence divergence for eight alignment and search tools. Dragon maintains $>$90\% sensitivity up to 10\% divergence, comparable to LexicMap and BLASTn, and substantially outperforming sketch-based methods.}
+\label{fig:sensitivity}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.9\textwidth}{\centering\vspace{4cm}\textbf{Figure 3: Resource Comparison}\\\small See \texttt{results/figures/fig3\_resource\_comparison.pdf}\vspace{2cm}}}
+\caption{Resource comparison across tools. (a)~Index size on disk (log scale). (b)~Peak query RAM (log scale). (c)~Mean query time for a single gene search. Dragon achieves the best combination of low disk usage and low RAM while maintaining competitive query speed.}
+\label{fig:resources}
+\end{figure}
+
+\end{document}

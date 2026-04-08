@@ -1,0 +1,223 @@
+"""
+Dragon Benchmark Pipeline
+=========================
+Compares Dragon against LexicMap, Minimap2, BLAST, MMseqs2, COBS, sourmash, and skani.
+
+Usage:
+    snakemake --cores 8 --use-conda
+    snakemake --cores 8 --use-conda -R plot_figures  # regenerate plots only
+"""
+
+import yaml
+from pathlib import Path
+
+configfile: "config.yaml"
+
+TOOLS = list(config["tools"].keys())
+DATASETS = list(config["datasets"].keys())
+DIVERGENCE_LEVELS = config["simulation"]["gene_queries"]["divergence_levels"]
+
+rule all:
+    input:
+        expand("results/metrics/{dataset}_{tool}_accuracy.tsv", dataset=DATASETS, tool=TOOLS),
+        expand("results/metrics/{dataset}_{tool}_resources.tsv", dataset=DATASETS, tool=TOOLS),
+        "results/figures/fig2_sensitivity_vs_divergence.pdf",
+        "results/figures/fig3_resource_comparison.pdf",
+        "results/figures/fig4_scalability.pdf",
+        "results/figures/fig5_precision_recall.pdf",
+        "results/figures/fig6_batch_throughput.pdf",
+
+
+# ===========================================================================
+# 1. SIMULATION
+# ===========================================================================
+
+rule extract_genes:
+    """Extract random genes from reference genomes as query sequences."""
+    input:
+        genome_dir = lambda wc: config["datasets"][wc.dataset]["genome_dir"]
+    output:
+        genes = "data/queries/{dataset}/genes.fa",
+        truth = "data/queries/{dataset}/genes_truth.tsv"
+    params:
+        num_genes = config["simulation"]["gene_queries"]["num_genes"],
+        min_len = config["simulation"]["gene_queries"]["min_length"],
+        max_len = config["simulation"]["gene_queries"]["max_length"],
+        num_genomes = config["simulation"]["gene_queries"]["num_source_genomes"]
+    conda: "envs/simulation.yaml"
+    shell:
+        """
+        python simulate/extract_genes.py \
+            --genome-dir {input.genome_dir} \
+            --output {output.genes} \
+            --truth {output.truth} \
+            --num-genes {params.num_genes} \
+            --min-length {params.min_len} \
+            --max-length {params.max_len} \
+            --num-genomes {params.num_genomes}
+        """
+
+rule mutate_genes:
+    """Introduce controlled mutations at various divergence levels."""
+    input:
+        genes = "data/queries/{dataset}/genes.fa"
+    output:
+        mutated = "data/queries/{dataset}/genes_div{div}.fa",
+        truth = "data/queries/{dataset}/genes_div{div}_truth.tsv"
+    params:
+        div = lambda wc: float(wc.div)
+    conda: "envs/simulation.yaml"
+    shell:
+        """
+        python simulate/mutate_sequences.py \
+            --input {input.genes} \
+            --output {output.mutated} \
+            --truth {output.truth} \
+            --divergence {params.div} \
+            --sub-rate 0.70 --ins-rate 0.20 --del-rate 0.10
+        """
+
+rule simulate_long_reads:
+    """Simulate ONT long reads using Badread."""
+    input:
+        genome_dir = lambda wc: config["datasets"][wc.dataset]["genome_dir"]
+    output:
+        reads = "data/queries/{dataset}/long_reads.fa"
+    conda: "envs/simulation.yaml"
+    shell:
+        """
+        bash simulate/run_badread.sh {input.genome_dir} {output.reads}
+        """
+
+
+# ===========================================================================
+# 2. INDEX CONSTRUCTION
+# ===========================================================================
+
+rule build_index:
+    """Build index for each tool."""
+    input:
+        genome_dir = lambda wc: config["datasets"][wc.dataset]["genome_dir"]
+    output:
+        flag = touch("results/index/{dataset}_{tool}/.done")
+    params:
+        tool_config = lambda wc: config["tools"][wc.tool],
+        index_dir = "results/index/{dataset}_{tool}",
+        threads = config["hardware"]["default_threads"]
+    conda: lambda wc: f"envs/{wc.tool}.yaml"
+    threads: config["hardware"]["default_threads"]
+    benchmark: "results/metrics/{dataset}_{tool}_index_benchmark.tsv"
+    shell:
+        """
+        /usr/bin/time -v bash -c '
+            mkdir -p {params.index_dir}
+            cmd="{params.tool_config[index_cmd]}"
+            cmd="${{cmd//{{binary}}/{params.tool_config[binary]}}}"
+            cmd="${{cmd//{{genome_dir}}/{input.genome_dir}}}"
+            cmd="${{cmd//{{index_dir}}/{params.index_dir}}}"
+            cmd="${{cmd//{{threads}}/{params.threads}}}"
+            eval $cmd
+        ' 2> results/metrics/{wildcards.dataset}_{wildcards.tool}_index_resources.txt
+        """
+
+
+# ===========================================================================
+# 3. SEARCH
+# ===========================================================================
+
+rule search_queries:
+    """Run search for each tool at each divergence level."""
+    input:
+        index_flag = "results/index/{dataset}_{tool}/.done",
+        query = "data/queries/{dataset}/genes_div{div}.fa"
+    output:
+        result = "results/search/{dataset}_{tool}_div{div}.out"
+    params:
+        tool_config = lambda wc: config["tools"][wc.tool],
+        index_dir = "results/index/{dataset}_{tool}",
+        threads = config["hardware"]["default_threads"]
+    conda: lambda wc: f"envs/{wc.tool}.yaml"
+    threads: config["hardware"]["default_threads"]
+    shell:
+        """
+        /usr/bin/time -v bash -c '
+            cmd="{params.tool_config[search_cmd]}"
+            cmd="${{cmd//{{binary}}/{params.tool_config[binary]}}}"
+            cmd="${{cmd//{{index_dir}}/{params.index_dir}}}"
+            cmd="${{cmd//{{query}}/{input.query}}}"
+            cmd="${{cmd//{{output}}/{output.result}}}"
+            cmd="${{cmd//{{threads}}/{params.threads}}}"
+            eval $cmd
+        ' 2> results/metrics/{wildcards.dataset}_{wildcards.tool}_div{wildcards.div}_resources.txt
+        """
+
+
+# ===========================================================================
+# 4. EVALUATION
+# ===========================================================================
+
+rule compute_accuracy:
+    """Compute sensitivity, precision, F1 for each tool."""
+    input:
+        results = expand(
+            "results/search/{{dataset}}_{{tool}}_div{div}.out",
+            div=DIVERGENCE_LEVELS
+        ),
+        truths = expand(
+            "data/queries/{{dataset}}/genes_div{div}_truth.tsv",
+            div=DIVERGENCE_LEVELS
+        )
+    output:
+        metrics = "results/metrics/{dataset}_{tool}_accuracy.tsv"
+    conda: "envs/simulation.yaml"
+    shell:
+        """
+        python scripts/compute_metrics.py \
+            --results {input.results} \
+            --truths {input.truths} \
+            --output {output.metrics} \
+            --tool {wildcards.tool} \
+            --dataset {wildcards.dataset}
+        """
+
+rule compute_resources:
+    """Parse resource usage from /usr/bin/time output."""
+    input:
+        resource_files = expand(
+            "results/metrics/{{dataset}}_{{tool}}_div{div}_resources.txt",
+            div=DIVERGENCE_LEVELS
+        ),
+        index_resources = "results/metrics/{dataset}_{tool}_index_resources.txt"
+    output:
+        metrics = "results/metrics/{dataset}_{tool}_resources.tsv"
+    conda: "envs/simulation.yaml"
+    shell:
+        """
+        python scripts/resource_usage.py \
+            --resource-files {input.resource_files} \
+            --index-resources {input.index_resources} \
+            --output {output.metrics} \
+            --tool {wildcards.tool} \
+            --dataset {wildcards.dataset}
+        """
+
+
+# ===========================================================================
+# 5. PLOTTING
+# ===========================================================================
+
+rule plot_figures:
+    """Generate all manuscript figures."""
+    input:
+        accuracy = expand("results/metrics/{dataset}_{tool}_accuracy.tsv",
+                          dataset=DATASETS, tool=TOOLS),
+        resources = expand("results/metrics/{dataset}_{tool}_resources.tsv",
+                           dataset=DATASETS, tool=TOOLS)
+    output:
+        fig2 = "results/figures/fig2_sensitivity_vs_divergence.pdf",
+        fig3 = "results/figures/fig3_resource_comparison.pdf",
+        fig4 = "results/figures/fig4_scalability.pdf",
+        fig5 = "results/figures/fig5_precision_recall.pdf",
+        fig6 = "results/figures/fig6_batch_throughput.pdf"
+    conda: "envs/simulation.yaml"
+    notebook: "notebooks/figures.ipynb"

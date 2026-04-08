@@ -1,0 +1,120 @@
+# Dragon Benchmark Configuration
+# ================================
+
+# Datasets
+datasets:
+  tier1:
+    name: "E. coli 500"
+    description: "500 complete E. coli/Shigella genomes from RefSeq"
+    genome_dir: "data/tier1_genomes"
+    num_genomes: 500
+
+  tier2:
+    name: "GTDB r220 representatives"
+    description: "~85K prokaryotic representative genomes"
+    genome_dir: "data/tier2_genomes"
+    num_genomes: 85000
+
+  tier3:
+    name: "AllTheBacteria v2"
+    description: "~1.9M prokaryotic assemblies"
+    genome_dir: "data/tier3_genomes"
+    num_genomes: 1900000
+
+# Simulation parameters
+simulation:
+  gene_queries:
+    num_genes: 1000
+    min_length: 500
+    max_length: 5000
+    num_source_genomes: 100
+    divergence_levels: [0.0, 0.01, 0.03, 0.05, 0.10, 0.15]
+    mutation_model:
+      substitution_rate: 0.70
+      insertion_rate: 0.20
+      deletion_rate: 0.10
+
+  long_reads:
+    num_genomes: 50
+    mean_length: 5000
+    min_identity: 0.85
+    max_identity: 0.99
+    chimera_rate: 0.01
+
+  short_reads:
+    num_genomes: 50
+    read_length: 150
+    coverage: 10
+
+  amr_genes:
+    source: "CARD"
+    card_url: "https://card.mcmaster.ca/latest/data"
+
+# Tools to benchmark
+tools:
+  dragon:
+    binary: "target/release/dragon"
+    version: "0.1.0"
+    index_cmd: "{binary} index -i {genome_dir} -o {index_dir} -j {threads}"
+    search_cmd: "{binary} search -i {index_dir} -q {query} -o {output} -j {threads}"
+
+  lexicmap:
+    binary: "lexicmap"
+    version: "latest"
+    index_cmd: "lexicmap index -I {genome_dir} -O {index_dir} -j {threads}"
+    search_cmd: "lexicmap search -d {index_dir} {query} -o {output} -j {threads}"
+
+  minimap2:
+    binary: "minimap2"
+    version: "latest"
+    index_cmd: "cat {genome_dir}/*.fa > {index_dir}/ref.fa && minimap2 -d {index_dir}/ref.mmi {index_dir}/ref.fa"
+    search_cmd: "minimap2 -a {index_dir}/ref.mmi {query} > {output}"
+
+  blastn:
+    binary: "blastn"
+    version: "latest"
+    index_cmd: "cat {genome_dir}/*.fa > {index_dir}/ref.fa && makeblastdb -in {index_dir}/ref.fa -dbtype nucl -out {index_dir}/ref"
+    search_cmd: "blastn -db {index_dir}/ref -query {query} -outfmt 6 -out {output} -num_threads {threads}"
+
+  mmseqs2:
+    binary: "mmseqs"
+    version: "latest"
+    index_cmd: "mmseqs createdb {genome_dir}/*.fa {index_dir}/ref"
+    search_cmd: "mmseqs easy-search {query} {index_dir}/ref {output} {index_dir}/tmp --search-type 3"
+
+  cobs:
+    binary: "cobs"
+    version: "latest"
+    index_cmd: "cobs compact-construct {genome_dir} {index_dir}/cobs.idx"
+    search_cmd: "cobs query {index_dir}/cobs.idx {query} > {output}"
+
+  sourmash:
+    binary: "sourmash"
+    version: "latest"
+    index_cmd: "sourmash sketch dna -p k=31 {genome_dir}/*.fa -o {index_dir}/sigs.zip"
+    search_cmd: "sourmash search {query} {index_dir}/sigs.zip -o {output}"
+
+  skani:
+    binary: "skani"
+    version: "latest"
+    index_cmd: "skani sketch {genome_dir}/*.fa -o {index_dir}/skani_db"
+    search_cmd: "skani search {query} -d {index_dir}/skani_db -o {output}"
+
+# Hardware
+hardware:
+  threads: [1, 4, 8, 16]
+  default_threads: 8
+
+# Metrics
+metrics:
+  accuracy:
+    - sensitivity
+    - precision
+    - f1_score
+    - alignment_identity_error
+  resources:
+    - peak_ram_gb
+    - wall_time_seconds
+    - cpu_time_seconds
+    - index_size_gb
+    - index_time_seconds

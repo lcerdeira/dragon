@@ -1,0 +1,500 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Benchmark methodology &mdash; Dragon 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=01f34227"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Benchmark results" href="results.html" />
+    <link rel="prev" title="Benchmark datasets" href="datasets.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            Dragon
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../getting-started/installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/installation.html#from-source-recommended">From source (recommended)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#install-rust">1. Install Rust</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#clone-and-build">2. Clone and build</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#optional-install-system-wide">3. (Optional) Install system-wide</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#verify-installation">4. Verify installation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/installation.html#optional-dependencies">Optional dependencies</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#ggcat-recommended-for-large-databases">GGCAT (recommended for large databases)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#benchmark-dependencies">Benchmark dependencies</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/installation.html#troubleshooting">Troubleshooting</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#sux-crate-build-failure"><code class="docutils literal notranslate"><span class="pre">sux</span></code> crate build failure</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started/installation.html#memory-issues-during-index-construction">Memory issues during index construction</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../getting-started/quickstart.html">Quick start</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/quickstart.html#step-1-prepare-genome-files">Step 1: Prepare genome files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/quickstart.html#step-2-build-the-index">Step 2: Build the index</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/quickstart.html#step-3-search">Step 3: Search</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/quickstart.html#step-4-inspect-results">Step 4: Inspect results</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/quickstart.html#example-output">Example output</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../getting-started/tutorial.html">Tutorial: AMR gene search</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/tutorial.html#scenario">Scenario</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/tutorial.html#step-1-download-test-data">Step 1: Download test data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/tutorial.html#step-2-build-index">Step 2: Build index</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/tutorial.html#step-3-search-amr-genes">Step 3: Search AMR genes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/tutorial.html#step-4-blast-tabular-output">Step 4: BLAST-tabular output</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/tutorial.html#step-5-batch-analysis">Step 5: Batch analysis</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/tutorial.html#performance-notes">Performance notes</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../user-guide/indexing.html">Indexing</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/indexing.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/indexing.html#command">Command</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/indexing.html#required-arguments">Required arguments</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/indexing.html#optional-arguments">Optional arguments</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/indexing.html#input-format">Input format</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/indexing.html#choosing-k-mer-size">Choosing k-mer size</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/indexing.html#index-files">Index files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/indexing.html#resource-requirements">Resource requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/indexing.html#ggcat-integration">GGCAT integration</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../user-guide/searching.html">Searching</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/searching.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/searching.html#command">Command</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/searching.html#required-arguments">Required arguments</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/searching.html#optional-arguments">Optional arguments</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/searching.html#query-types">Query types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/searching.html#seed-finding-details">Seed finding details</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/searching.html#candidate-filtering">Candidate filtering</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/searching.html#chaining">Chaining</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/searching.html#memory-management">Memory management</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../user-guide/output-formats.html">Output formats</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/output-formats.html#paf-pairwise-alignment-format">PAF (Pairwise Alignment Format)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/output-formats.html#optional-tags">Optional tags</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/output-formats.html#example">Example</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/output-formats.html#blast-tabular-outfmt-6">BLAST tabular (outfmt 6)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/output-formats.html#id1">Example</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/output-formats.html#parsing-output">Parsing output</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/output-formats.html#extract-top-hits-per-query">Extract top hits per query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/output-formats.html#filter-by-identity">Filter by identity</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/output-formats.html#count-hits-per-genome">Count hits per genome</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../user-guide/performance-tuning.html">Performance tuning</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/performance-tuning.html#hardware-recommendations">Hardware recommendations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/performance-tuning.html#ssd-vs-hdd">SSD vs HDD</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/performance-tuning.html#tuning-parameters">Tuning parameters</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/performance-tuning.html#for-maximum-sensitivity">For maximum sensitivity</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/performance-tuning.html#for-maximum-speed">For maximum speed</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/performance-tuning.html#for-low-memory-machines-4-gb-total-ram">For low-memory machines (4 GB total RAM)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/performance-tuning.html#scaling-guidelines">Scaling guidelines</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/performance-tuning.html#number-of-genomes-vs-resources">Number of genomes vs resources</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/performance-tuning.html#query-length-vs-performance">Query length vs performance</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../user-guide/performance-tuning.html#distributing-pre-built-indices">Distributing pre-built indices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">Architecture overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/overview.html#the-redundancy-problem">The redundancy problem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/overview.html#pipeline-overview">Pipeline overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/overview.html#index-construction">Index construction</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/overview.html#query-pipeline">Query pipeline</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/overview.html#why-this-is-efficient">Why this is efficient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/overview.html#module-map">Module map</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/de-bruijn-graph.html">Coloured compacted de Bruijn graph</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/de-bruijn-graph.html#what-is-a-de-bruijn-graph">What is a de Bruijn graph?</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/de-bruijn-graph.html#why-use-a-de-bruijn-graph">Why use a de Bruijn graph?</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/de-bruijn-graph.html#construction">Construction</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/de-bruijn-graph.html#ggcat-advantages">GGCAT advantages</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/de-bruijn-graph.html#fallback-builder">Fallback builder</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/de-bruijn-graph.html#colour-storage">Colour storage</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/fm-index.html">Run-length FM-index</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/fm-index.html#background">Background</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/fm-index.html#why-run-length">Why run-length?</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/fm-index.html#construction">Construction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/fm-index.html#backward-search">Backward search</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/fm-index.html#variable-length-seed-matching">Variable-length seed matching</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/fm-index.html#position-to-unitig-mapping">Position-to-unitig mapping</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/chaining.html">Graph-aware colinear chaining</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/chaining.html#the-chaining-problem">The chaining problem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/chaining.html#why-graph-aware">Why graph-aware?</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/chaining.html#algorithm">Algorithm</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/chaining.html#step-1-map-seeds-to-genome-coordinates">Step 1: Map seeds to genome coordinates</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/chaining.html#step-2-sort-anchors-by-reference-position">Step 2: Sort anchors by reference position</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/chaining.html#step-3-fenwick-tree-dp">Step 3: Fenwick tree DP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../architecture/chaining.html#step-4-gap-sensitive-scoring">Step 4: Gap-sensitive scoring</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/chaining.html#complexity">Complexity</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/data-structures.html">Data structures</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/data-structures.html#bit-dna-encoding">2-bit DNA encoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/data-structures.html#roaring-bitmaps">Roaring Bitmaps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/data-structures.html#elias-fano-cumulative-length-index">Elias-Fano cumulative length index</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/data-structures.html#fenwick-tree-binary-indexed-tree">Fenwick tree (Binary Indexed Tree)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../architecture/data-structures.html#variable-length-integers-varint">Variable-length integers (varint)</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmark</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="datasets.html">Benchmark datasets</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="datasets.html#tiered-approach">Tiered approach</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="datasets.html#tier-1-small-development-ci">Tier 1: Small (development &amp; CI)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="datasets.html#tier-2-medium-validation">Tier 2: Medium (validation)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="datasets.html#tier-3-large-full-benchmark">Tier 3: Large (full benchmark)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="datasets.html#query-types">Query types</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="datasets.html#gene-level-queries-primary">Gene-level queries (primary)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="datasets.html#long-reads-badread">Long reads (Badread)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="datasets.html#challenging-scenarios">Challenging scenarios</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Benchmark methodology</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#tools-compared">Tools compared</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#accuracy-metrics">Accuracy metrics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#resource-metrics">Resource metrics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#scalability-metrics">Scalability metrics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#read-simulation">Read simulation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#gene-level-queries">Gene-level queries</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#long-reads-badread">Long reads (Badread)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#statistical-analysis">Statistical analysis</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="results.html">Benchmark results</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="results.html#sensitivity-vs-divergence">Sensitivity vs divergence</a></li>
+<li class="toctree-l2"><a class="reference internal" href="results.html#resource-comparison">Resource comparison</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="results.html#index-size">Index size</a></li>
+<li class="toctree-l3"><a class="reference internal" href="results.html#peak-query-ram">Peak query RAM</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="results.html#batch-query-performance">Batch query performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="results.html#figures">Figures</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="reproducing.html">Reproducing benchmarks</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="reproducing.html#quick-start-synthetic-data">Quick start (synthetic data)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reproducing.html#full-benchmark-snakemake">Full benchmark (Snakemake)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="reproducing.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="reproducing.html#running">Running</a></li>
+<li class="toctree-l3"><a class="reference internal" href="reproducing.html#configuration">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="reproducing.html#pipeline-structure">Pipeline structure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reproducing.html#adding-a-new-tool">Adding a new tool</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../api/cli.html">CLI reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../api/cli.html#dragon-index"><code class="docutils literal notranslate"><span class="pre">dragon</span> <span class="pre">index</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/cli.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/cli.html#examples">Examples</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/cli.html#dragon-search"><code class="docutils literal notranslate"><span class="pre">dragon</span> <span class="pre">search</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/cli.html#id1">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/cli.html#id2">Examples</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/cli.html#dragon-info"><code class="docutils literal notranslate"><span class="pre">dragon</span> <span class="pre">info</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/cli.html#id3">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/cli.html#example-output">Example output</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/cli.html#environment-variables">Environment variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../api/modules.html">Module reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../api/modules.html#index-modules-src-index">Index modules (<code class="docutils literal notranslate"><span class="pre">src/index/</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#index-dbg"><code class="docutils literal notranslate"><span class="pre">index::dbg</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#index-unitig"><code class="docutils literal notranslate"><span class="pre">index::unitig</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#index-color"><code class="docutils literal notranslate"><span class="pre">index::color</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#index-fm"><code class="docutils literal notranslate"><span class="pre">index::fm</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#index-paths"><code class="docutils literal notranslate"><span class="pre">index::paths</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#index-metadata"><code class="docutils literal notranslate"><span class="pre">index::metadata</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/modules.html#query-modules-src-query">Query modules (<code class="docutils literal notranslate"><span class="pre">src/query/</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#query-seed"><code class="docutils literal notranslate"><span class="pre">query::seed</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#query-candidate"><code class="docutils literal notranslate"><span class="pre">query::candidate</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#query-chain"><code class="docutils literal notranslate"><span class="pre">query::chain</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#query-align"><code class="docutils literal notranslate"><span class="pre">query::align</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/modules.html#data-structures-src-ds">Data structures (<code class="docutils literal notranslate"><span class="pre">src/ds/</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#ds-fenwick"><code class="docutils literal notranslate"><span class="pre">ds::fenwick</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#ds-elias-fano"><code class="docutils literal notranslate"><span class="pre">ds::elias_fano</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#ds-varint"><code class="docutils literal notranslate"><span class="pre">ds::varint</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/modules.html#utilities-src-util">Utilities (<code class="docutils literal notranslate"><span class="pre">src/util/</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#util-dna"><code class="docutils literal notranslate"><span class="pre">util::dna</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#util-mmap"><code class="docutils literal notranslate"><span class="pre">util::mmap</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/modules.html#i-o-modules-src-io">I/O modules (<code class="docutils literal notranslate"><span class="pre">src/io/</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#io-fasta"><code class="docutils literal notranslate"><span class="pre">io::fasta</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#io-paf"><code class="docutils literal notranslate"><span class="pre">io::paf</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/modules.html#io-blast"><code class="docutils literal notranslate"><span class="pre">io::blast</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">Dragon</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Benchmark methodology</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/benchmark/methodology.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="benchmark-methodology">
+<h1>Benchmark methodology<a class="headerlink" href="#benchmark-methodology" title="Link to this heading"></a></h1>
+<section id="tools-compared">
+<h2>Tools compared<a class="headerlink" href="#tools-compared" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Tool</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Version</p></th>
+<th class="head"><p>Why included</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Dragon</strong></p></td>
+<td><p>Graph + FM-index</p></td>
+<td><p>0.1.0</p></td>
+<td><p>Our tool</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>LexicMap</strong></p></td>
+<td><p>LexicHash probes</p></td>
+<td><p>latest</p></td>
+<td><p>Direct predecessor (Nature Biotech 2025)</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Minimap2</strong></p></td>
+<td><p>Minimiser + chain</p></td>
+<td><p>2.28</p></td>
+<td><p>Gold standard for long-read alignment</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>BLASTn</strong></p></td>
+<td><p>Word + extend</p></td>
+<td><p>2.15.0</p></td>
+<td><p>Gold standard for sensitivity</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>MMseqs2</strong></p></td>
+<td><p>k-mer prefilter</p></td>
+<td><p>15</p></td>
+<td><p>Fast protein/nucleotide search</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>COBS</strong></p></td>
+<td><p>Bit-sliced signatures</p></td>
+<td><p>latest</p></td>
+<td><p>k-mer containment search</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>sourmash</strong></p></td>
+<td><p>FracMinHash sketches</p></td>
+<td><p>4.8</p></td>
+<td><p>Containment estimation</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>skani</strong></p></td>
+<td><p>Sparse chaining ANI</p></td>
+<td><p>0.2</p></td>
+<td><p>Fast ANI estimation</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="accuracy-metrics">
+<h2>Accuracy metrics<a class="headerlink" href="#accuracy-metrics" title="Link to this heading"></a></h2>
+<p>All metrics computed against ground truth from simulation:</p>
+<ul class="simple">
+<li><p><strong>Sensitivity (recall)</strong>: TP / (TP + FN) — fraction of true hits found</p></li>
+<li><p><strong>Precision</strong>: TP / (TP + FP) — fraction of reported hits that are correct</p></li>
+<li><p><strong>F1 score</strong>: harmonic mean of precision and recall</p></li>
+<li><p><strong>Alignment identity error</strong>: |reported_identity - true_identity|</p></li>
+</ul>
+<p>Metrics are stratified by:</p>
+<ul class="simple">
+<li><p>Divergence level (0-15%)</p></li>
+<li><p>Query length (short/medium/long)</p></li>
+</ul>
+</section>
+<section id="resource-metrics">
+<h2>Resource metrics<a class="headerlink" href="#resource-metrics" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Peak RAM</strong>: maximum resident set size via <code class="docutils literal notranslate"><span class="pre">getrusage()</span></code> or <code class="docutils literal notranslate"><span class="pre">/usr/bin/time</span> <span class="pre">-v</span></code></p></li>
+<li><p><strong>Wall-clock time</strong>: elapsed time per query</p></li>
+<li><p><strong>CPU time</strong>: user + system time</p></li>
+<li><p><strong>Index size on disk</strong>: total bytes of all index files</p></li>
+<li><p><strong>Index construction time</strong>: wall-clock time for <code class="docutils literal notranslate"><span class="pre">dragon</span> <span class="pre">index</span></code></p></li>
+</ul>
+</section>
+<section id="scalability-metrics">
+<h2>Scalability metrics<a class="headerlink" href="#scalability-metrics" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>RAM and time vs number of indexed genomes (100, 1K, 10K, 100K, 1M, 2M)</p></li>
+<li><p>RAM and time vs batch size (1, 10, 100, 1000 queries)</p></li>
+<li><p>Performance on HDD vs SSD</p></li>
+</ul>
+</section>
+<section id="read-simulation">
+<h2>Read simulation<a class="headerlink" href="#read-simulation" title="Link to this heading"></a></h2>
+<section id="gene-level-queries">
+<h3>Gene-level queries<a class="headerlink" href="#gene-level-queries" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Extract random genes</span>
+<span class="n">python3</span> <span class="n">benchmark</span><span class="o">/</span><span class="n">simulate</span><span class="o">/</span><span class="n">extract_genes</span><span class="o">.</span><span class="n">py</span> \
+  <span class="o">--</span><span class="n">genome</span><span class="o">-</span><span class="nb">dir</span> <span class="n">data</span><span class="o">/</span><span class="n">genomes</span><span class="o">/</span> \
+  <span class="o">--</span><span class="n">output</span> <span class="n">queries</span><span class="o">/</span><span class="n">genes</span><span class="o">.</span><span class="n">fa</span> \
+  <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">genes</span> <span class="mi">1000</span> <span class="o">--</span><span class="nb">min</span><span class="o">-</span><span class="n">length</span> <span class="mi">500</span> <span class="o">--</span><span class="nb">max</span><span class="o">-</span><span class="n">length</span> <span class="mi">5000</span>
+
+<span class="c1"># Introduce mutations</span>
+<span class="n">python3</span> <span class="n">benchmark</span><span class="o">/</span><span class="n">simulate</span><span class="o">/</span><span class="n">mutate_sequences</span><span class="o">.</span><span class="n">py</span> \
+  <span class="o">--</span><span class="nb">input</span> <span class="n">queries</span><span class="o">/</span><span class="n">genes</span><span class="o">.</span><span class="n">fa</span> \
+  <span class="o">--</span><span class="n">output</span> <span class="n">queries</span><span class="o">/</span><span class="n">genes_div0</span><span class="mf">.05</span><span class="o">.</span><span class="n">fa</span> \
+  <span class="o">--</span><span class="n">divergence</span> <span class="mf">0.05</span>
+</pre></div>
+</div>
+</section>
+<section id="long-reads-badread">
+<h3>Long reads (Badread)<a class="headerlink" href="#long-reads-badread" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>benchmark/simulate/run_badread.sh<span class="w"> </span>data/genomes/<span class="w"> </span>queries/long_reads.fa
+</pre></div>
+</div>
+</section>
+</section>
+<section id="statistical-analysis">
+<h2>Statistical analysis<a class="headerlink" href="#statistical-analysis" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>Each measurement repeated 3 times; median reported</p></li>
+<li><p>Error bars show min/max across replicates</p></li>
+<li><p>Statistical significance tested with Wilcoxon signed-rank test where applicable</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="datasets.html" class="btn btn-neutral float-left" title="Benchmark datasets" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="results.html" class="btn btn-neutral float-right" title="Benchmark results" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, Louise Cerdeira, Kat Holt.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
