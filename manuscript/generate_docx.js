@@ -203,7 +203,7 @@ const doc = new Document({
           spacing: { after: 80 },
           children: [
             textRun("Louise Cerdeira"), superRun("1,*"),
-            textRun(", Kat Holt"), superRun("1"),
+            textRun(""), superRun("1"),
           ],
         }),
         new Paragraph({
