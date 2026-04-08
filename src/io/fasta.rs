@@ -58,7 +58,10 @@ pub fn read_sequences(path: &Path) -> Result<Vec<Sequence>> {
             // FASTQ quality header - skip next line
             continue;
         } else {
-            current_seq.extend_from_slice(line.as_bytes());
+            // Filter to only valid DNA bases (strip GGCAT's trailing '$' and other non-DNA chars)
+            current_seq.extend(
+                line.bytes().filter(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't' | b'N' | b'n'))
+            );
         }
     }
 
