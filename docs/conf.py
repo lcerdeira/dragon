@@ -2,8 +2,8 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
 project = "Dragon"
-copyright = "2025, Louise Cerdeira, Kat Holt"
-author = "Louise Cerdeira, Kat Holt"
+copyright = "2026, Louise Cerdeira"
+author = "Louise Cerdeira"
 release = "0.1.0"
 
 extensions = [
