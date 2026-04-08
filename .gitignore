@@ -35,6 +35,9 @@ manuscript/node_modules/
 manuscript/package.json
 manuscript/package-lock.json
 
+# DOCX generation
+manuscript/*.docx
+
 # Generated figures (regenerable from scripts)
 manuscript/figures/*.png
 manuscript/figures/*.pdf
