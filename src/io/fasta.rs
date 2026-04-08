@@ -142,18 +142,25 @@ impl Iterator for FastaReader {
 /// List all FASTA files in a directory.
 pub fn list_fasta_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
+    list_fasta_files_recursive(dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn list_fasta_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if let Some(ext) = path.extension() {
+        if path.is_dir() {
+            list_fasta_files_recursive(&path, files)?;
+        } else if let Some(ext) = path.extension() {
             let ext = ext.to_string_lossy().to_lowercase();
             if matches!(ext.as_str(), "fa" | "fasta" | "fna" | "fsa") {
                 files.push(path);
             }
         }
     }
-    files.sort();
-    Ok(files)
+    Ok(())
 }
 
 #[cfg(test)]
