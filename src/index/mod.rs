@@ -3,7 +3,9 @@ pub mod dbg;
 pub mod fm;
 pub mod metadata;
 pub mod paths;
+pub mod specificity;
 pub mod unitig;
+pub mod update;
 
 use anyhow::Result;
 use std::path::Path;
@@ -52,6 +54,15 @@ pub fn build_index_with_options(
     // Step 5: Build genome path index
     log::info!("Step 5/5: Building genome path index...");
     paths::build_path_index(genome_dir, &unitigs, output_dir, kmer_size)?;
+
+    // Step 6: Build specificity index (private unitig sets per genome)
+    log::info!("Step 6: Building specificity index...");
+    let color_index = color::load_color_index(output_dir)?;
+    let spec_index = specificity::SpecificityIndex::build(
+        &color_index,
+        specificity::DEFAULT_MAX_SHARING,
+    )?;
+    spec_index.save(output_dir)?;
 
     // Write metadata
     metadata::write_metadata(output_dir, &dbg_result, &unitigs)?;

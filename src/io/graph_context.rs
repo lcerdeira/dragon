@@ -20,6 +20,11 @@ pub struct SubgraphNode {
     pub genome_ids: Vec<u32>,
     pub is_hit: bool,
     pub sequence: Vec<u8>,
+    /// Information content: log2(total_genomes / color_cardinality).
+    /// High for genome-specific unitigs, low for core genome.
+    pub information_content: f64,
+    /// Whether this unitig is private (present in ≤3 genomes).
+    pub is_private: bool,
 }
 
 /// An edge between two unitigs in the subgraph (adjacency in a genome path).
@@ -124,6 +129,14 @@ pub fn extract_hit_subgraphs(
                     .map(|bm| bm.iter().collect::<Vec<u32>>())
                     .unwrap_or_default();
 
+                let color_card = colors.len() as u64;
+                let total_genomes = color_index.num_genomes();
+                let ic = if color_card > 0 && total_genomes > 0 {
+                    (total_genomes as f64 / color_card as f64).log2()
+                } else {
+                    0.0
+                };
+
                 // Get the actual unitig sequence
                 let sequence = unitigs.get_sequence(step.unitig_id);
 
@@ -132,6 +145,8 @@ pub fn extract_hit_subgraphs(
                     genome_ids: colors,
                     is_hit: hit_unitigs.contains(&step.unitig_id),
                     sequence,
+                    information_content: ic,
+                    is_private: color_card <= 3,
                 });
             }
 
@@ -178,9 +193,16 @@ pub fn extract_hit_subgraphs(
 ///
 /// Output includes:
 /// - H line: GFA header
-/// - S lines: segments (unitigs) with sequence + color annotation
+/// - S lines: segments (unitigs) with sequence + annotation tags:
+///   - LN:i: sequence length
+///   - RC:i: genome count (color cardinality)
+///   - CL:Z: genome IDs (comma-separated)
+///   - TP:Z: HIT (direct alignment) or CTX (context neighbourhood)
+///   - IC:f: information content (bits; high = genome-specific)
+///   - PV:Z: YES if private unitig (≤3 genomes), NO otherwise
+///   - CO:Z: Bandage-compatible hex color (#FF0000=hit, #00AA00=private, #AAAAAA=context)
 /// - L lines: links (edges) between unitigs with overlap
-/// - Comment lines marking which unitigs are direct hits vs context
+/// - Comment lines with subgraph metadata
 pub fn write_gfa<W: Write>(
     writer: &mut W,
     subgraphs: &[HitSubgraph],
@@ -191,6 +213,14 @@ pub fn write_gfa<W: Write>(
             writer,
             "# Subgraph {} for query={} target={}",
             idx, sg.query_name, sg.target_name
+        )?;
+        writeln!(
+            writer,
+            "# Nodes: {} ({} HIT, {} CTX, {} private)",
+            sg.nodes.len(),
+            sg.nodes.iter().filter(|n| n.is_hit).count(),
+            sg.nodes.iter().filter(|n| !n.is_hit).count(),
+            sg.nodes.iter().filter(|n| n.is_private).count(),
         )?;
 
         // Segment lines
@@ -203,6 +233,15 @@ pub fn write_gfa<W: Write>(
                 .join(",");
             let hit_tag = if node.is_hit { "HIT" } else { "CTX" };
 
+            // Bandage-compatible color: red=hit, green=private context, grey=shared context
+            let bandage_color = if node.is_hit {
+                "#FF0000"
+            } else if node.is_private {
+                "#00AA00"
+            } else {
+                "#AAAAAA"
+            };
+
             let seq_str = if node.sequence.is_empty() {
                 "*".to_string()
             } else {
@@ -211,13 +250,16 @@ pub fn write_gfa<W: Write>(
 
             writeln!(
                 writer,
-                "S\tunitig_{}\t{}\tLN:i:{}\tRC:i:{}\tCL:Z:{}\tTP:Z:{}",
+                "S\tunitig_{}\t{}\tLN:i:{}\tRC:i:{}\tCL:Z:{}\tTP:Z:{}\tIC:f:{:.2}\tPV:Z:{}\tCO:Z:{}",
                 node.unitig_id,
                 seq_str,
                 node.sequence.len(),
                 node.genome_ids.len(),
                 color_tag,
                 hit_tag,
+                node.information_content,
+                if node.is_private { "YES" } else { "NO" },
+                bandage_color,
             )?;
         }
 
@@ -258,12 +300,16 @@ mod tests {
                     genome_ids: vec![0, 1, 2],
                     is_hit: true,
                     sequence: b"ACGTACGT".to_vec(),
+                    information_content: 5.0,
+                    is_private: true,
                 },
                 SubgraphNode {
                     unitig_id: 11,
                     genome_ids: vec![0, 1],
                     is_hit: false,
                     sequence: b"TTGCAA".to_vec(),
+                    information_content: 2.0,
+                    is_private: false,
                 },
             ],
             edges: vec![SubgraphEdge {
@@ -282,5 +328,9 @@ mod tests {
         assert!(output.contains("L\tunitig_10\t+\tunitig_11\t+\t0M"));
         assert!(output.contains("TP:Z:HIT"));
         assert!(output.contains("TP:Z:CTX"));
+        assert!(output.contains("IC:f:5.00"));
+        assert!(output.contains("PV:Z:YES"));
+        assert!(output.contains("CO:Z:#FF0000")); // hit = red
+        assert!(output.contains("CO:Z:#AAAAAA")); // non-private context = grey
     }
 }

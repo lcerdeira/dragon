@@ -33,7 +33,7 @@ set -euo pipefail
 REFSEQ_FTP="https://ftp.ncbi.nlm.nih.gov/genomes/refseq/bacteria"
 ASSEMBLY_SUMMARY_URL="$REFSEQ_FTP/assembly_summary.txt"
 DRAGON="${DRAGON:-$HOME/Dragon/target/release/dragon}"
-WORKSPACE="$HOME/dragon_workspace/refseq"
+WORKSPACE="${WORKSPACE:-$HOME/dragon_workspace/refseq}"
 GENOME_DIR="$WORKSPACE/genomes"
 INDEX_DIR="$HOME/dragon_index_refseq"
 DOWNLOAD_DIR="$WORKSPACE/downloads"
@@ -114,6 +114,8 @@ if [ "$REPRESENTATIVE_ONLY" = true ]; then
     awk -F'\t' '
         !/^#/ && ($5 == "representative genome" || $5 == "reference genome") && $20 != "na" {
             # Build the URL: ftp_path + "/" + basename + "_genomic.fna.gz"
+            # Strip trailing slash from ftp_path before splitting
+            gsub(/\/+$/, "", $20)
             n = split($20, parts, "/")
             basename = parts[n]
             print $20 "/" basename "_genomic.fna.gz"
@@ -124,6 +126,8 @@ else
     # All complete + chromosome-level genomes
     awk -F'\t' '
         !/^#/ && ($12 == "Complete Genome" || $12 == "Chromosome") && $20 != "na" {
+            # Strip trailing slash from ftp_path before splitting
+            gsub(/\/+$/, "", $20)
             n = split($20, parts, "/")
             basename = parts[n]
             print $20 "/" basename "_genomic.fna.gz"
