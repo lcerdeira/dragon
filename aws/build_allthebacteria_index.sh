@@ -30,10 +30,10 @@ set -euo pipefail
 ATB_RELEASE="${ATB_RELEASE:-0.2}"
 ATB_FTP="https://ftp.ebi.ac.uk/pub/databases/AllTheBacteria/Releases"
 DRAGON="${DRAGON:-$HOME/Dragon/target/release/dragon}"
-WORKSPACE="$HOME/dragon_workspace/allthebacteria"
-GENOME_DIR="$WORKSPACE/genomes"
 INDEX_DIR="$HOME/dragon_index_allthebacteria"
-DOWNLOAD_DIR="$WORKSPACE/downloads"
+WORKSPACE=""
+GENOME_DIR=""
+DOWNLOAD_DIR=""
 KMER_SIZE="${KMER_SIZE:-31}"
 LOW_MEMORY=false
 THREADS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -49,6 +49,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Derive workspace from output directory so everything stays on the same volume
+WORKSPACE="${WORKSPACE:-$(dirname "$INDEX_DIR")/atb_workspace}"
+GENOME_DIR="$WORKSPACE/genomes"
+DOWNLOAD_DIR="$WORKSPACE/downloads"
 
 echo "====================================="
 echo "Dragon AllTheBacteria Index Build"
