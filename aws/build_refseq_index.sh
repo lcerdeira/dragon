@@ -133,9 +133,7 @@ else
 fi
 
 # Convert FTP to HTTPS (NCBI supports both)
-sed -i.bak 's|^ftp://|https://|' "$URL_LIST" 2>/dev/null || \
-    sed 's|^ftp://|https://|' "$URL_LIST" > "$URL_LIST.tmp" && mv "$URL_LIST.tmp" "$URL_LIST"
-rm -f "$URL_LIST.bak"
+sed -i 's|^ftp://|https://|' "$URL_LIST"
 
 TOTAL_GENOMES=$(wc -l < "$URL_LIST" | tr -d ' ')
 echo "Found $TOTAL_GENOMES genomes to download"
