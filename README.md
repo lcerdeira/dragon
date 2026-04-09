@@ -4,6 +4,7 @@
 
 <p align="center"><strong>Resource-efficient sequence alignment against millions of prokaryotic genomes using graph-based compressed indexing</strong></p>
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19478347.svg)](https://doi.org/10.5281/zenodo.19478347)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-39%20passing-brightgreen.svg)](#testing)
