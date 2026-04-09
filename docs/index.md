@@ -65,7 +65,7 @@ api/modules
 
 ## Citation
 
-> Cerdeira, L. and Holt, K. (2025). Dragon: resource-efficient sequence alignment against millions of prokaryotic genomes using graph-based compressed indexing. *In preparation.*
+> Cerdeira, L. (2026). Dragon: resource-efficient sequence alignment against millions of prokaryotic genomes using graph-based compressed indexing. *In preparation.*
 
 ## Licence
 
