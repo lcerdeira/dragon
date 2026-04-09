@@ -105,11 +105,15 @@ fn build_with_ggcat(
         use std::io::{BufRead, Write};
 
         let query_output = output_dir.join("unitig_colors");
+        // Use output_dir for temp files (ggcat query also writes to .temp_files/)
+        let query_temp_dir = output_dir.join(".ggcat_query_temp");
+        std::fs::create_dir_all(&query_temp_dir)?;
         let query_status = std::process::Command::new("ggcat")
             .args([
                 "query",
                 "--colors",
                 "-k", &kmer_size.to_string(),
+                "--temp-dir", &query_temp_dir.to_string_lossy(),
                 "--colored-query-output-format", "json-lines-with-numbers",
                 "-o", &query_output.to_string_lossy(),
                 &unitig_file.to_string_lossy(),
@@ -117,6 +121,7 @@ fn build_with_ggcat(
             ])
             .status()
             .context("Failed to run ggcat query for color extraction")?;
+        let _ = std::fs::remove_dir_all(&query_temp_dir);
 
         if !query_status.success() {
             anyhow::bail!("ggcat query failed during color extraction");
