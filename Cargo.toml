@@ -39,7 +39,7 @@ indicatif = "0.17"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
-rand = "0.8"
+rand = "0.9"
 
 [[bench]]
 name = "benchmark"
