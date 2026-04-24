@@ -59,3 +59,7 @@ manuscript/figures/*.pdf
 # OS files
 Thumbs.db
 Desktop.ini
+
+manuscript/
+results/
+aws/
