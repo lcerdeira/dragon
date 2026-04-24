@@ -8,6 +8,7 @@ pub mod paths;
 pub mod specificity;
 pub mod unitig;
 pub mod update;
+pub mod zarr_backend;
 
 use anyhow::Result;
 use std::path::Path;
