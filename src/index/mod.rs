@@ -40,8 +40,10 @@ pub fn build_index_with_options(
     // Check if Step 1 can be skipped (resume from existing unitigs + colors)
     let unitig_file = output_dir.join("unitigs.fa");
     let color_file = output_dir.join("colors.tsv");
-    let dbg_result = if unitig_file.exists() && color_file.exists() {
-        log::info!("Step 1/5: SKIPPED — existing unitigs.fa + colors.tsv found (resume mode)");
+    let colors_drgn_path = output_dir.join("colors.drgn");
+    let has_colors = color_file.exists() || colors_drgn_path.exists();
+    let dbg_result = if unitig_file.exists() && has_colors {
+        log::info!("Step 1/5: SKIPPED — existing unitigs.fa + colors found (resume mode)");
         let genome_files = crate::io::fasta::list_fasta_files(genome_dir)?;
         let num_genomes = genome_files.len();
         // Count unitigs by counting '>' lines (fast, no RAM needed for huge files)

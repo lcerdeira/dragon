@@ -96,27 +96,30 @@ fn build_with_ggcat(
         anyhow::bail!("GGCAT exited with non-zero status: {}", status);
     }
 
-    // Extract per-unitig color sets by parsing GGCAT's binary colormap directly.
-    // This bypasses `ggcat query` (which produces 500+ GB JSONL for large indices)
-    // by reading unitigs.colors.dat — the compact binary format (~11 GB for 26K
-    // genomes vs 665 GB JSONL, a 60x reduction in intermediate storage).
-    log::info!("Extracting unitig colors from GGCAT binary colormap...");
-    let color_file = output_dir.join("colors.tsv");
+    // Build colors.drgn DIRECTLY from GGCAT binary colormap — skipping the
+    // colors.tsv intermediate which can be 300+ GB for large indices.
+    log::info!("Building color index directly from GGCAT colormap...");
     let colormap_path = output_dir.join("unitigs.colors.dat");
 
     if !colormap_path.exists() {
         anyhow::bail!("GGCAT colormap not found at {:?} (GGCAT may have failed)", colormap_path);
     }
 
-    let header = crate::index::ggcat_colors::write_colors_tsv(
+    let header = crate::index::ggcat_colors::build_color_drgn_direct(
         &colormap_path,
         &unitig_file,
-        &color_file,
-    ).context("Failed to parse GGCAT binary colormap")?;
+        output_dir,
+    ).context("Failed to build color index from GGCAT colormap")?;
     log::info!(
-        "  Parsed {} color subsets across {} genomes",
+        "  Built colors.drgn: {} color subsets across {} genomes",
         header.subsets_count, header.colors_count
     );
+
+    // Empty colors.tsv placeholder (some downstream code expects its path)
+    let color_file = output_dir.join("colors.tsv");
+    if !color_file.exists() {
+        std::fs::write(&color_file, b"")?;
+    }
 
     // Count unitigs
     let seqs = crate::io::fasta::read_sequences(&unitig_file)?;

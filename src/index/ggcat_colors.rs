@@ -218,6 +218,118 @@ pub fn parse_all(path: &std::path::Path) -> Result<(GgcatColorHeader, HashMap<u3
     Ok((header, out))
 }
 
+/// Build Dragon's colors.drgn directly from GGCAT colormap + unitigs.fa.
+///
+/// This skips the intermediate colors.tsv file entirely (which can be
+/// hundreds of GB for large indices) — instead, RoaringBitmaps are built
+/// in memory and written straight to the final colors.drgn format.
+///
+/// Memory footprint: ~(num_unitigs * avg_genomes_per_unitig * 4 bytes).
+/// For 10M unitigs × 10 genomes avg = ~400 MB, well within any compute node.
+pub fn build_color_drgn_direct(
+    colormap_path: &std::path::Path,
+    unitigs_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<GgcatColorHeader> {
+    use std::io::{BufRead, Write};
+    use roaring::RoaringBitmap;
+
+    log::info!("Parsing GGCAT colormap {:?}", colormap_path);
+    let (header, subsets) = parse_all(colormap_path)?;
+    log::info!(
+        "  Colormap: {} genomes, {} color subsets, {} MB disk",
+        header.colors_count,
+        header.subsets_count,
+        header.total_size / 1_048_576
+    );
+
+    log::info!("Parsing unitig headers and building bitmaps...");
+    let reader = std::io::BufReader::new(std::fs::File::open(unitigs_path)?);
+    let mut bitmaps: Vec<RoaringBitmap> = Vec::new();
+    let mut unitig_count = 0u64;
+
+    for line in reader.lines() {
+        let line = line?;
+        if !line.starts_with('>') {
+            continue;
+        }
+        // Parse: >unitig_id LN:i:len C:hex_id:count ...
+        let parts: Vec<&str> = line[1..].split_whitespace().collect();
+        let mut bm = RoaringBitmap::new();
+        for part in &parts[1..] {
+            if let Some(rest) = part.strip_prefix("C:") {
+                if let Some(hex_id_str) = rest.split(':').next() {
+                    if let Ok(hex_id) = u32::from_str_radix(hex_id_str, 16) {
+                        if let Some(genomes) = subsets.get(&hex_id) {
+                            for &g in genomes {
+                                bm.insert(g);
+                            }
+                            break; // typically one C: tag per unitig
+                        }
+                    }
+                }
+            }
+        }
+        bitmaps.push(bm);
+        unitig_count += 1;
+        if unitig_count % 1_000_000 == 0 {
+            log::info!("  Processed {} unitigs...", unitig_count);
+        }
+    }
+
+    log::info!("Writing {} bitmaps to colors.drgn", bitmaps.len());
+
+    // Serialize to on-disk format (matches color::build_color_index layout)
+    let num_unitigs = bitmaps.len();
+    let num_genomes = header.colors_count as usize;
+    let index_path = output_dir.join("colors.drgn");
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&index_path)?);
+
+    // Header (bincode: magic u32, version u32, num_unitigs u64, num_genomes u64 = 24 bytes)
+    #[derive(serde::Serialize)]
+    struct CiHdr {
+        magic: u32,
+        version: u32,
+        num_unitigs: u64,
+        num_genomes: u64,
+    }
+    let hdr = CiHdr {
+        magic: 0x4452_474E, // "DRGN"
+        version: 1,
+        num_unitigs: num_unitigs as u64,
+        num_genomes: num_genomes as u64,
+    };
+    let hdr_bytes = bincode::serialize(&hdr)?;
+    writer.write_all(&hdr_bytes)?;
+
+    // Serialize bitmaps to compute offsets
+    let mut bitmap_data: Vec<Vec<u8>> = Vec::with_capacity(num_unitigs);
+    for bm in &bitmaps {
+        let mut buf = Vec::new();
+        bm.serialize_into(&mut buf)?;
+        bitmap_data.push(buf);
+    }
+
+    // Offset table
+    let mut cumulative_offset = 0u64;
+    for data in &bitmap_data {
+        writer.write_all(&cumulative_offset.to_le_bytes())?;
+        cumulative_offset += data.len() as u64;
+    }
+    writer.write_all(&cumulative_offset.to_le_bytes())?;
+
+    // Bitmap data
+    for data in &bitmap_data {
+        writer.write_all(data)?;
+    }
+
+    let size = std::fs::metadata(&index_path)?.len();
+    log::info!("  colors.drgn written: {} unitigs, {:.1} MB",
+        num_unitigs, size as f64 / 1_048_576.0);
+
+    Ok(header)
+}
+
 /// Write a colors.tsv file directly from a GGCAT colormap + unitigs.fa.
 ///
 /// Reads `unitigs.fa` to get the `C:hex_id:count` tags per unitig, decodes
