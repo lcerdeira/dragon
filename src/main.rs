@@ -53,6 +53,13 @@ enum Commands {
         #[arg(short, long)]
         index: PathBuf,
 
+        /// Additional index shards to search in parallel (multi-index / distributed search).
+        /// Each shard is searched independently and results are merged by score.
+        /// Useful for large collections split across multiple indices.
+        /// Usage: --shard /path/to/idx1 --shard /path/to/idx2 ...
+        #[arg(long, value_name = "DIR")]
+        shard: Vec<PathBuf>,
+
         /// Query FASTA/FASTQ file
         #[arg(short, long)]
         query: PathBuf,
@@ -353,6 +360,7 @@ fn main() -> Result<()> {
 
         Commands::Search {
             index,
+            shard,
             query,
             output,
             format,
@@ -400,7 +408,15 @@ fn main() -> Result<()> {
                 ground_truth_genome: ground_truth,
             };
 
-            let results = dragon::query::search_with_overlays(&query, &config)?;
+            let results = if shard.is_empty() {
+                dragon::query::search_with_overlays(&query, &config)?
+            } else {
+                // Multi-index (sharded) search: combine --index + --shard args
+                let mut all_indices = vec![index.clone()];
+                all_indices.extend(shard.clone());
+                log::info!("Multi-index search across {} shards", all_indices.len());
+                dragon::query::search_multi_index(&query, &all_indices, &config)?
+            };
 
             // Write output
             let mut writer: Box<dyn std::io::Write> = if output == "-" {

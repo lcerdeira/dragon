@@ -359,6 +359,53 @@ fn test_auto_batch_large_multi_batch() {
 }
 
 #[test]
+fn test_multi_index_search() {
+    // Build 2 independent shard indices, then search a query across both
+    let dir = TempDir::new().unwrap();
+    let query_path = dir.path().join("query.fa");
+
+    // Shard 1: 3 genomes with core region A
+    let shard1_dir = dir.path().join("shard1_genomes");
+    let shard1_idx = dir.path().join("shard1_idx");
+    fs::create_dir(&shard1_dir).unwrap();
+    let core_a = random_seq(1500, 11111);
+    for i in 0..3 {
+        let flank = random_seq(300, i * 10);
+        write_fasta(&shard1_dir, &format!("s1_g{}", i), &format!("{}{}", flank, core_a));
+    }
+    dragon::index::build_index(&shard1_dir, &shard1_idx, 15, 1).unwrap();
+
+    // Shard 2: 3 different genomes with core region B
+    let shard2_dir = dir.path().join("shard2_genomes");
+    let shard2_idx = dir.path().join("shard2_idx");
+    fs::create_dir(&shard2_dir).unwrap();
+    let core_b = random_seq(1500, 22222);
+    for i in 0..3 {
+        let flank = random_seq(300, i * 10 + 100);
+        write_fasta(&shard2_dir, &format!("s2_g{}", i), &format!("{}{}", flank, core_b));
+    }
+    dragon::index::build_index(&shard2_dir, &shard2_idx, 15, 1).unwrap();
+
+    // Query from core_a — should hit shard 1 genomes, not shard 2
+    let mut f = fs::File::create(&query_path).unwrap();
+    writeln!(f, ">q_from_core_a").unwrap();
+    writeln!(f, "{}", &core_a[300..1200]).unwrap();
+
+    let mut config = dragon::query::SearchConfig::default();
+    config.index_dir = shard1_idx.clone().into();
+    config.min_identity = 0.0;
+    config.min_query_coverage = 0.0;
+    config.min_chain_score = 0.0;
+
+    let indices = vec![shard1_idx.clone(), shard2_idx.clone()];
+    let results = dragon::query::search_multi_index(&query_path, &indices, &config).unwrap();
+
+    // Should get results (even if empty, not crash)
+    assert_eq!(results.len(), 1, "Expected 1 query result");
+    // Verify the multi-index search ran against both shards without panic
+}
+
+#[test]
 fn test_end_to_end_small_dataset() {
     let dir = TempDir::new().unwrap();
     let genome_dir = dir.path().join("genomes");

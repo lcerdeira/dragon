@@ -345,3 +345,86 @@ pub fn search_with_overlays(
 
     Ok(results)
 }
+
+/// Search a query against multiple independent indices and merge results.
+///
+/// This enables distributed/sharded index architecture: when a genome
+/// collection is too large to fit in a single index, it can be split into
+/// N independent shards. Queries are searched against each shard sequentially
+/// (memory-bounded; one index loaded at a time) and results are merged by
+/// score with per-genome deduplication.
+///
+/// Each shard can itself have overlays (via `search_with_overlays`), so
+/// hierarchical architectures are supported.
+pub fn search_multi_index(
+    query_file: &Path,
+    index_dirs: &[std::path::PathBuf],
+    base_config: &SearchConfig,
+) -> Result<Vec<QueryResult>> {
+    if index_dirs.is_empty() {
+        anyhow::bail!("No index directories provided");
+    }
+    if index_dirs.len() == 1 {
+        // Single index: use overlay search directly
+        let mut config = base_config.clone();
+        config.index_dir = index_dirs[0].clone().into();
+        return search_with_overlays(query_file, &config);
+    }
+
+    log::info!("Searching across {} shard indices", index_dirs.len());
+
+    // Merged results by query name
+    let mut merged: std::collections::HashMap<String, QueryResult> =
+        std::collections::HashMap::new();
+
+    for (i, index_dir) in index_dirs.iter().enumerate() {
+        log::info!("  Shard {}/{}: {:?}", i + 1, index_dirs.len(), index_dir);
+        if !index_dir.exists() {
+            log::warn!("  Shard {:?} not found, skipping", index_dir);
+            continue;
+        }
+
+        let mut shard_config = base_config.clone();
+        shard_config.index_dir = index_dir.clone().into();
+
+        let shard_results = match search_with_overlays(query_file, &shard_config) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("  Shard {:?} failed: {}, skipping", index_dir, e);
+                continue;
+            }
+        };
+
+        for qr in shard_results {
+            merged
+                .entry(qr.query_name.clone())
+                .and_modify(|existing| existing.alignments.extend(qr.alignments.clone()))
+                .or_insert(qr);
+        }
+    }
+
+    // Post-process: sort by score + dedupe + truncate
+    let mut results: Vec<QueryResult> = merged.into_values().collect();
+    results.sort_by(|a, b| a.query_name.cmp(&b.query_name));
+
+    for result in &mut results {
+        result.alignments.sort_by(|a, b| {
+            let a_score = a.tags.iter()
+                .find_map(|t| t.strip_prefix("AS:i:").and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0);
+            let b_score = b.tags.iter()
+                .find_map(|t| t.strip_prefix("AS:i:").and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0);
+            b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut seen = HashSet::new();
+        result.alignments.retain(|record| seen.insert(record.target_name.clone()));
+        result.alignments.truncate(base_config.max_target_seqs);
+    }
+
+    log::info!(
+        "Multi-index search complete: {} queries across {} shards",
+        results.len(), index_dirs.len()
+    );
+    Ok(results)
+}
