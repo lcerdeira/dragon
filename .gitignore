@@ -60,6 +60,8 @@ manuscript/figures/*.pdf
 Thumbs.db
 Desktop.ini
 
+# Moved to private companion repo: github.com/lcerdeira/dragon-private
+benchmark/
 manuscript/
 results/
 aws/
