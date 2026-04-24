@@ -319,6 +319,40 @@ enum Commands {
         #[arg(long)]
         total_genomes: Option<usize>,
     },
+
+    /// Export an existing Dragon index as a Zarr v3 store (cloud-native format)
+    ///
+    /// The Zarr store is chunked + Zstd-compressed and can be opened by any
+    /// Zarr-aware tool (zarr-python, xarray). Use `dragon search-zarr` to
+    /// query the Zarr store directly; existing `fm_index.bin` is not modified.
+    ExportZarr {
+        /// Path to an existing Dragon index directory
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Output path for the Zarr store (directory)
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Pattern-search a Zarr-backed Dragon index (chunked/compressed reads)
+    ///
+    /// Reads only the chunks touched by the query, demonstrating cloud-native
+    /// random access. Reports matching text positions and their unitig IDs.
+    /// For full alignment use `dragon search` against the binary index.
+    SearchZarr {
+        /// Path to a Zarr store produced by `dragon export-zarr`
+        #[arg(short, long)]
+        zarr: PathBuf,
+
+        /// Query FASTA file (one pattern per record)
+        #[arg(short, long)]
+        query: PathBuf,
+
+        /// Output TSV path (use "-" for stdout)
+        #[arg(short, long, default_value = "-")]
+        output: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1237,6 +1271,52 @@ echo "  Download complete."
                 report.total_queries,
                 report.aggregate_species.len()
             );
+        }
+
+        Commands::ExportZarr { index, output } => {
+            log::info!("Exporting Dragon index to Zarr v3 store");
+            log::info!("Source: {:?}", index);
+            log::info!("Dest:   {:?}", output);
+            let stats = dragon::index::zarr_backend::export_to_zarr(&index, &output)?;
+            log::info!(
+                "Export complete: {} unitigs, {} genomes, {} text bytes, {} SA entries, {} bitmap bytes",
+                stats.num_unitigs, stats.num_genomes, stats.text_len, stats.sa_len, stats.colors_bytes
+            );
+        }
+
+        Commands::SearchZarr { zarr, query, output } => {
+            log::info!("Searching Zarr store {:?}", zarr);
+            let fm = dragon::index::zarr_backend::ZarrFmIndex::open(&zarr)?;
+            let colors = dragon::index::zarr_backend::ZarrColorIndex::open(&zarr)?;
+            log::info!(
+                "Opened index: {} unitigs, {} genomes, k={}, {} text bytes",
+                fm.num_unitigs, fm.num_genomes, fm.kmer_size, fm.text_len
+            );
+
+            let records = dragon::io::fasta::read_sequences(&query)?;
+            let mut writer: Box<dyn std::io::Write> = if output == "-" {
+                Box::new(std::io::BufWriter::new(std::io::stdout()))
+            } else {
+                Box::new(std::io::BufWriter::new(std::fs::File::create(&output)?))
+            };
+            use std::io::Write as _;
+            writeln!(writer, "query\thits\tunitig_id\toffset\tgenomes")?;
+
+            for rec in records {
+                let positions = fm.search(&rec.seq)?;
+                let n = positions.len();
+                if n == 0 {
+                    writeln!(writer, "{}\t0\t\t\t", rec.name)?;
+                    continue;
+                }
+                for pos in positions.iter().take(64) {
+                    if let Some((uid, off)) = fm.position_to_unitig(*pos) {
+                        let bm = colors.get_colors(uid)?;
+                        let genomes: Vec<String> = bm.iter().map(|g| g.to_string()).collect();
+                        writeln!(writer, "{}\t{}\t{}\t{}\t{}", rec.name, n, uid, off, genomes.join(","))?;
+                    }
+                }
+            }
         }
     }
 

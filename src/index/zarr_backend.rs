@@ -22,14 +22,17 @@
 //! JSON attributes on the root group.
 
 use anyhow::{Context, Result};
+use roaring::RoaringBitmap;
 use std::path::Path;
 use std::sync::Arc;
 
 use zarrs::array::codec::ZstdCodec;
-use zarrs::array::{ArrayBuilder, data_type};
+use zarrs::array::{Array, ArrayBuilder, ArraySubset, data_type};
 use zarrs::filesystem::FilesystemStore;
 use zarrs::group::GroupBuilder;
 use zarrs::storage::ReadableWritableListableStorage;
+
+use crate::ds::elias_fano::CumulativeLengthIndex;
 
 /// On-disk format version. Bump when the layout changes incompatibly.
 pub const DRAGON_ZARR_FORMAT_VERSION: u32 = 1;
@@ -232,6 +235,186 @@ fn write_colors(
     Ok(total)
 }
 
+// ---------------------------------------------------------------------------
+// Read path: ZarrFmIndex / ZarrColorIndex
+// ---------------------------------------------------------------------------
+
+/// FM-index variant backed by a Zarr store. Reads are lazy and chunked — only
+/// the chunks touched by a query are decompressed, making this cheap over
+/// remote object stores (S3, GCS) that expose HTTP range requests.
+pub struct ZarrFmIndex {
+    text: Array<FilesystemStore>,
+    sa: Array<FilesystemStore>,
+    pub cumulative_lengths: CumulativeLengthIndex,
+    pub text_len: u64,
+    pub sa_len: u64,
+    pub kmer_size: usize,
+    pub num_unitigs: u64,
+    pub num_genomes: u64,
+}
+
+impl ZarrFmIndex {
+    /// Open a Zarr store produced by [`export_to_zarr`] for read-only query.
+    pub fn open(zarr_path: &Path) -> Result<Self> {
+        let store = Arc::new(FilesystemStore::new(zarr_path)
+            .with_context(|| format!("open zarr store at {:?}", zarr_path))?);
+
+        let text = Array::open(store.clone(), "/text")
+            .context("open /text array")?;
+        let sa = Array::open(store.clone(), "/suffix_array")
+            .context("open /suffix_array array")?;
+        let lengths_arr = Array::open(store.clone(), "/unitig_lengths")
+            .context("open /unitig_lengths array")?;
+
+        let lengths: Vec<u64> = lengths_arr
+            .retrieve_array_subset::<Vec<u64>>(&lengths_arr.subset_all())
+            .context("read unitig_lengths")?;
+        let cumulative_lengths = CumulativeLengthIndex::from_lengths(&lengths);
+
+        let text_len = text.shape()[0];
+        let sa_len = sa.shape()[0];
+
+        // Root-group attributes hold Dragon metadata.
+        let root = zarrs::group::Group::open(store, "/")
+            .context("open root group")?;
+        let attrs = root.attributes();
+        let kmer_size = attrs.get("kmer_size")
+            .and_then(|v| v.as_u64()).unwrap_or(31) as usize;
+        let num_unitigs = attrs.get("num_unitigs")
+            .and_then(|v| v.as_u64()).unwrap_or(lengths.len() as u64);
+        let num_genomes = attrs.get("num_genomes")
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+
+        Ok(Self {
+            text, sa, cumulative_lengths,
+            text_len, sa_len, kmer_size, num_unitigs, num_genomes,
+        })
+    }
+
+    /// Read `SA[rank]` via a single-element Zarr read.
+    fn sa_get(&self, rank: u64) -> Result<u64> {
+        let subset = ArraySubset::new_with_ranges(&[rank..rank + 1]);
+        let vals: Vec<u64> = self.sa.retrieve_array_subset(&subset)?;
+        Ok(vals[0])
+    }
+
+    /// Read `text[start..end]` via a single chunked Zarr read.
+    fn text_slice(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        let end = end.min(self.text_len);
+        if end <= start { return Ok(Vec::new()); }
+        let subset = ArraySubset::new_with_ranges(&[start..end]);
+        Ok(self.text.retrieve_array_subset(&subset)?)
+    }
+
+    fn lower_bound(&self, pattern: &[u8]) -> Result<u64> {
+        let mut lo = 0u64;
+        let mut hi = self.sa_len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let suffix_start = self.sa_get(mid)?;
+            let suffix = self.text_slice(suffix_start, suffix_start + pattern.len() as u64)?;
+            if suffix.as_slice() < pattern {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    fn upper_bound(&self, pattern: &[u8]) -> Result<u64> {
+        let mut lo = 0u64;
+        let mut hi = self.sa_len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let suffix_start = self.sa_get(mid)?;
+            let suffix = self.text_slice(suffix_start, suffix_start + pattern.len() as u64)?;
+            if suffix.as_slice() <= pattern {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Backward-search equivalent: return all text positions where `pattern` occurs.
+    pub fn search(&self, pattern: &[u8]) -> Result<Vec<u64>> {
+        if pattern.is_empty() || self.text_len == 0 {
+            return Ok(Vec::new());
+        }
+        let lo = self.lower_bound(pattern)?;
+        let hi = self.upper_bound(pattern)?;
+        if hi <= lo { return Ok(Vec::new()); }
+        let subset = ArraySubset::new_with_ranges(&[lo..hi]);
+        Ok(self.sa.retrieve_array_subset(&subset)?)
+    }
+
+    /// Count occurrences without materializing positions.
+    pub fn count(&self, pattern: &[u8]) -> Result<usize> {
+        if pattern.is_empty() || self.text_len == 0 {
+            return Ok(0);
+        }
+        let lo = self.lower_bound(pattern)?;
+        let hi = self.upper_bound(pattern)?;
+        Ok((hi - lo) as usize)
+    }
+
+    /// Map a text position to `(unitig_id, offset)`.
+    pub fn position_to_unitig(&self, pos: u64) -> Option<(u32, u32)> {
+        self.cumulative_lengths.unitig_at_position(pos)
+    }
+}
+
+/// Color index variant backed by a Zarr store.
+///
+/// Each `get_colors` call reads two u64s (offset pair) then the raw bitmap
+/// bytes — so it touches at most a handful of chunks per query.
+pub struct ZarrColorIndex {
+    offsets: Array<FilesystemStore>,
+    bitmaps: Array<FilesystemStore>,
+    pub num_unitigs: u64,
+    pub num_genomes: u64,
+}
+
+impl ZarrColorIndex {
+    pub fn open(zarr_path: &Path) -> Result<Self> {
+        let store = Arc::new(FilesystemStore::new(zarr_path)?);
+        let offsets = Array::open(store.clone(), "/colors/offsets")
+            .context("open /colors/offsets")?;
+        let bitmaps = Array::open(store.clone(), "/colors/bitmaps")
+            .context("open /colors/bitmaps")?;
+
+        let root = zarrs::group::Group::open(store, "/")?;
+        let attrs = root.attributes();
+        let num_unitigs = attrs.get("num_unitigs")
+            .and_then(|v| v.as_u64()).unwrap_or(offsets.shape()[0].saturating_sub(1));
+        let num_genomes = attrs.get("num_genomes")
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+
+        Ok(Self { offsets, bitmaps, num_unitigs, num_genomes })
+    }
+
+    pub fn get_colors(&self, unitig_id: u32) -> Result<RoaringBitmap> {
+        let uid = unitig_id as u64;
+        if uid >= self.num_unitigs {
+            return Ok(RoaringBitmap::new());
+        }
+        let off_subset = ArraySubset::new_with_ranges(&[uid..uid + 2]);
+        let offs: Vec<u64> = self.offsets.retrieve_array_subset(&off_subset)?;
+        let (start, end) = (offs[0], offs[1]);
+        if end <= start {
+            return Ok(RoaringBitmap::new());
+        }
+        let bm_subset = ArraySubset::new_with_ranges(&[start..end]);
+        let bytes: Vec<u8> = self.bitmaps.retrieve_array_subset(&bm_subset)?;
+        Ok(RoaringBitmap::deserialize_from(bytes.as_slice())?)
+    }
+
+    pub fn num_unitigs(&self) -> u64 { self.num_unitigs }
+    pub fn num_genomes(&self) -> u64 { self.num_genomes }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +457,53 @@ mod tests {
         let read: Vec<u8> = arr
             .retrieve_array_subset::<Vec<u8>>(&arr.subset_all())?;
         assert_eq!(read.len() as u64, stats.text_len);
+        Ok(())
+    }
+
+    /// Parity: every search that succeeds against the in-memory FM-index must
+    /// return the same set of positions when issued against ZarrFmIndex.
+    #[test]
+    fn zarr_search_parity() -> Result<()> {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let tmp = tempfile::tempdir()?;
+        let idx_dir = tmp.path().join("idx");
+        std::fs::create_dir_all(&idx_dir)?;
+
+        let text = b"ACGTACGTACGT$TTGGCCAATTGG$ACGTACGT$".to_vec();
+        let lengths = [12u64, 11, 8];
+        let unitigs = UnitigSet::from_fm_text(&text, &lengths);
+        build_fm_index(&unitigs, &idx_dir)?;
+
+        let color_tsv = idx_dir.join("colors.tsv");
+        std::fs::write(&color_tsv, "0\t0\n1\t0\n2\t0\n")?;
+        crate::index::color::build_color_index(&color_tsv, &idx_dir, 1)?;
+
+        let zarr_dir = tmp.path().join("parity.zarr");
+        export_to_zarr(&idx_dir, &zarr_dir)?;
+
+        let baseline = crate::index::fm::load_fm_index(&idx_dir)?;
+        let zarr_fm = ZarrFmIndex::open(&zarr_dir)?;
+
+        for pat in [&b"ACGT"[..], b"TTGG", b"CGTA", b"GGCC", b"NNNN"] {
+            let mut want: Vec<u64> = baseline.search(pat).into_iter().map(|x| x as u64).collect();
+            let mut got: Vec<u64> = zarr_fm.search(pat)?;
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "mismatch for pattern {:?}", std::str::from_utf8(pat).unwrap_or("?"));
+            assert_eq!(zarr_fm.count(pat)?, baseline.count(pat));
+        }
+
+        // Colors parity.
+        let baseline_colors = crate::index::color::load_color_index(&idx_dir)?;
+        let zarr_colors = ZarrColorIndex::open(&zarr_dir)?;
+        assert_eq!(zarr_colors.num_unitigs(), baseline_colors.num_unitigs());
+        for uid in 0..baseline_colors.num_unitigs() as u32 {
+            let a = baseline_colors.get_colors(uid)?;
+            let b = zarr_colors.get_colors(uid)?;
+            assert_eq!(a, b, "color mismatch for unitig {uid}");
+        }
+
         Ok(())
     }
 }
