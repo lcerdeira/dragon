@@ -37,16 +37,31 @@ pub fn build_index_with_options(
 
     std::fs::create_dir_all(output_dir)?;
 
-    // Check if Step 1 can be skipped (resume from existing unitigs + colors)
+    // Check if Step 1 can be skipped (resume from existing outputs)
     let unitig_file = output_dir.join("unitigs.fa");
     let color_file = output_dir.join("colors.tsv");
     let colors_drgn_path = output_dir.join("colors.drgn");
+    let fm_path = output_dir.join("fm_index.bin");
     let has_colors = color_file.exists() || colors_drgn_path.exists();
-    let dbg_result = if unitig_file.exists() && has_colors {
+
+    // If fm_index.bin + colors.drgn already exist, we can skip GGCAT entirely.
+    // unitigs.fa isn't needed (Step 2 reconstructs UnitigSet from fm_index.bin).
+    let dbg_result = if fm_path.exists() && colors_drgn_path.exists() {
+        log::info!("Step 1/5: SKIPPED — fm_index.bin + colors.drgn already exist (full resume mode)");
+        let genome_files = crate::io::fasta::list_fasta_files(genome_dir)?;
+        let num_genomes = genome_files.len();
+        log::info!("  Resuming with existing FM-index, {} genomes", num_genomes);
+        dbg::DbgResult {
+            unitig_file: unitig_file.clone(),  // may not exist, used only for Step 2 which also skips
+            color_file: color_file.clone(),
+            num_genomes,
+            num_unitigs: 0,  // recomputed from fm_index in Step 2
+            kmer_size,
+        }
+    } else if unitig_file.exists() && has_colors {
         log::info!("Step 1/5: SKIPPED — existing unitigs.fa + colors found (resume mode)");
         let genome_files = crate::io::fasta::list_fasta_files(genome_dir)?;
         let num_genomes = genome_files.len();
-        // Count unitigs by counting '>' lines (fast, no RAM needed for huge files)
         let num_unitigs = {
             use std::io::BufRead;
             let f = std::io::BufReader::new(std::fs::File::open(&unitig_file)?);
