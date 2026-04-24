@@ -40,6 +40,11 @@ enum Commands {
         /// Maximum RAM in GB for low-memory mode (default: 8)
         #[arg(long, default_value = "8.0")]
         max_ram: f64,
+
+        /// Automatically split into batches if genome count exceeds RAM capacity.
+        /// Each batch is built separately and merged as an overlay for unified querying.
+        #[arg(long)]
+        auto: bool,
     },
 
     /// Search query sequences against a Dragon index
@@ -322,15 +327,15 @@ fn main() -> Result<()> {
             threads,
             low_memory,
             max_ram,
+            auto,
         } => {
             log::info!("Dragon index construction");
             log::info!("Input: {:?}", input);
             log::info!("Output: {:?}", output);
 
-            let max_ram_bytes = if low_memory {
+            let max_ram_bytes = if low_memory || auto {
                 log::info!(
-                    "Low-memory mode enabled: RAM budget {:.1} GB \
-                     (uses disk-based sorting for suffix array construction)",
+                    "RAM budget: {:.1} GB",
                     max_ram
                 );
                 Some((max_ram * 1_073_741_824.0) as usize)
@@ -338,7 +343,12 @@ fn main() -> Result<()> {
                 None
             };
 
-            dragon::index::build_index_with_options(&input, &output, kmer_size, threads, max_ram_bytes)?;
+            if auto {
+                log::info!("Auto-batching enabled: will split large collections if needed");
+                dragon::index::auto_batch::build_index_auto(&input, &output, kmer_size, threads, max_ram_bytes)?;
+            } else {
+                dragon::index::build_index_with_options(&input, &output, kmer_size, threads, max_ram_bytes)?;
+            }
         }
 
         Commands::Search {

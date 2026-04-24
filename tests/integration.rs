@@ -293,6 +293,72 @@ fn test_fm_variable_length_search() {
 // ============================================================================
 
 #[test]
+fn test_auto_batch_small_single_batch() {
+    // Small dataset should NOT trigger batching — single-index fast path
+    let dir = TempDir::new().unwrap();
+    let genome_dir = dir.path().join("genomes");
+    let index_dir = dir.path().join("index");
+    fs::create_dir(&genome_dir).unwrap();
+
+    // 3 small genomes
+    for i in 0..3 {
+        let seq = random_seq(1000, i * 100);
+        write_fasta(&genome_dir, &format!("g{}", i), &seq);
+    }
+
+    // Big RAM budget → single batch
+    let result = dragon::index::auto_batch::build_index_auto(
+        &genome_dir, &index_dir, 15, 1, Some(64 * 1024 * 1024 * 1024),
+    );
+    assert!(result.is_ok(), "auto-batch failed: {:?}", result.err());
+
+    // Must produce a valid single-index (no overlay_manifest)
+    assert!(index_dir.join("metadata.json").exists());
+    assert!(index_dir.join("fm_index.bin").exists());
+    let metadata = dragon::index::metadata::load_metadata(&index_dir).unwrap();
+    assert_eq!(metadata.num_genomes, 3);
+}
+
+#[test]
+fn test_auto_batch_large_multi_batch() {
+    // Force batching by setting a tiny RAM budget
+    let dir = TempDir::new().unwrap();
+    let genome_dir = dir.path().join("genomes");
+    let index_dir = dir.path().join("index");
+    fs::create_dir(&genome_dir).unwrap();
+
+    // 10 genomes, but tiny RAM forces 2+ batches
+    for i in 0..10 {
+        let seq = random_seq(500, i * 73);
+        write_fasta(&genome_dir, &format!("g{}", i), &seq);
+    }
+
+    // Force 2 batches: 10 genomes × 30 MB × 1.25 = need ≥ 375 MB for single batch
+    // Set budget to 150 MB → should force ~2 batches
+    let result = dragon::index::auto_batch::build_index_auto(
+        &genome_dir, &index_dir, 15, 1, Some(150 * 1024 * 1024),
+    );
+    assert!(result.is_ok(), "auto-batch failed: {:?}", result.err());
+
+    // Must produce base index
+    assert!(index_dir.join("metadata.json").exists());
+    assert!(index_dir.join("fm_index.bin").exists());
+
+    // Must produce overlay manifest (indicating batching happened)
+    let manifest_path = index_dir.join("overlay_manifest.json");
+    assert!(manifest_path.exists(),
+        "Expected overlay manifest for multi-batch build");
+
+    // Verify overlays directory has entries
+    let overlays_dir = index_dir.join("overlays");
+    assert!(overlays_dir.exists());
+    let overlay_count = fs::read_dir(&overlays_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    assert!(overlay_count >= 1, "Expected at least 1 overlay, got {}", overlay_count);
+}
+
+#[test]
 fn test_end_to_end_small_dataset() {
     let dir = TempDir::new().unwrap();
     let genome_dir = dir.path().join("genomes");

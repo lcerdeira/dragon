@@ -413,6 +413,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "bio",
+ "byteorder",
  "clap",
  "criterion",
  "env_logger",

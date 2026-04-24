@@ -96,58 +96,27 @@ fn build_with_ggcat(
         anyhow::bail!("GGCAT exited with non-zero status: {}", status);
     }
 
-    // Extract proper per-unitig color sets using ggcat query.
-    // GGCAT's C: tags in FASTA headers use internal color-set IDs, not genome indices.
-    // We use ggcat query --colors on the unitigs to get actual genome assignments.
-    log::info!("Extracting unitig colors via ggcat query...");
+    // Extract per-unitig color sets by parsing GGCAT's binary colormap directly.
+    // This bypasses `ggcat query` (which produces 500+ GB JSONL for large indices)
+    // by reading unitigs.colors.dat — the compact binary format (~11 GB for 26K
+    // genomes vs 665 GB JSONL, a 60x reduction in intermediate storage).
+    log::info!("Extracting unitig colors from GGCAT binary colormap...");
     let color_file = output_dir.join("colors.tsv");
-    {
-        use std::io::{BufRead, Write};
+    let colormap_path = output_dir.join("unitigs.colors.dat");
 
-        let query_output = output_dir.join("unitig_colors");
-        // Use output_dir for temp files (ggcat query also writes to .temp_files/)
-        let query_temp_dir = output_dir.join(".ggcat_query_temp");
-        std::fs::create_dir_all(&query_temp_dir)?;
-        let query_status = std::process::Command::new("ggcat")
-            .args([
-                "query",
-                "--colors",
-                "-k", &kmer_size.to_string(),
-                "--temp-dir", &query_temp_dir.to_string_lossy(),
-                "--colored-query-output-format", "json-lines-with-numbers",
-                "-o", &query_output.to_string_lossy(),
-                &unitig_file.to_string_lossy(),
-                &unitig_file.to_string_lossy(),
-            ])
-            .status()
-            .context("Failed to run ggcat query for color extraction")?;
-        let _ = std::fs::remove_dir_all(&query_temp_dir);
-
-        if !query_status.success() {
-            anyhow::bail!("ggcat query failed during color extraction");
-        }
-
-        // Parse JSONL: each line = {"query_index":N, "matches":{"genome_id": coverage, ...}}
-        let jsonl_path = query_output.with_extension("jsonl");
-        let reader = std::io::BufReader::new(std::fs::File::open(&jsonl_path)?);
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(&color_file)?);
-
-        for line in reader.lines() {
-            let line = line?;
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                let uid = val.get("query_index").and_then(|v| v.as_u64()).unwrap_or(0);
-                if let Some(matches) = val.get("matches").and_then(|m| m.as_object()) {
-                    let genome_ids: Vec<String> = matches.keys().cloned().collect();
-                    writeln!(writer, "{}\t{}", uid, genome_ids.join(","))?;
-                } else {
-                    writeln!(writer, "{}\t", uid)?;
-                }
-            }
-        }
-
-        // Clean up
-        let _ = std::fs::remove_file(&jsonl_path);
+    if !colormap_path.exists() {
+        anyhow::bail!("GGCAT colormap not found at {:?} (GGCAT may have failed)", colormap_path);
     }
+
+    let header = crate::index::ggcat_colors::write_colors_tsv(
+        &colormap_path,
+        &unitig_file,
+        &color_file,
+    ).context("Failed to parse GGCAT binary colormap")?;
+    log::info!(
+        "  Parsed {} color subsets across {} genomes",
+        header.subsets_count, header.colors_count
+    );
 
     // Count unitigs
     let seqs = crate::io::fasta::read_sequences(&unitig_file)?;

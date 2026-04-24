@@ -1,6 +1,8 @@
+pub mod auto_batch;
 pub mod color;
 pub mod dbg;
 pub mod fm;
+pub mod ggcat_colors;
 pub mod metadata;
 pub mod paths;
 pub mod specificity;
