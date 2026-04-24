@@ -64,17 +64,35 @@ pub fn build_index_with_options(
         dbg::build_cdbg(genome_dir, output_dir, kmer_size, threads)?
     };
 
+    let fm_exists = output_dir.join("fm_index.bin").exists();
+    let colors_drgn_exists = output_dir.join("colors.drgn").exists();
+
     // Step 2: Parse unitigs and encode in 2-bit format
-    log::info!("Step 2/5: Encoding unitigs...");
-    let unitigs = unitig::parse_and_encode_unitigs(&dbg_result.unitig_file)?;
+    let unitigs = if fm_exists {
+        log::info!("Step 2/5: SKIPPED — fm_index.bin exists, loading unitigs from it");
+        let fm_index = fm::load_fm_index(output_dir)?;
+        let unitig_lengths: Vec<u64> = fm_index.cumulative_lengths.lengths().to_vec();
+        unitig::UnitigSet::from_fm_text(&fm_index.text, &unitig_lengths)
+    } else {
+        log::info!("Step 2/5: Encoding unitigs...");
+        unitig::parse_and_encode_unitigs(&dbg_result.unitig_file)?
+    };
 
     // Step 3: Build color index (Roaring Bitmaps)
-    log::info!("Step 3/5: Building color index...");
-    color::build_color_index(&dbg_result.color_file, output_dir, dbg_result.num_genomes)?;
+    if colors_drgn_exists {
+        log::info!("Step 3/5: SKIPPED — colors.drgn already exists");
+    } else {
+        log::info!("Step 3/5: Building color index...");
+        color::build_color_index(&dbg_result.color_file, output_dir, dbg_result.num_genomes)?;
+    }
 
     // Step 4: Build FM-index over concatenated unitigs
-    log::info!("Step 4/5: Building FM-index...");
-    fm::build_fm_index_with_ram(&unitigs, output_dir, max_ram_bytes)?;
+    if fm_exists {
+        log::info!("Step 4/5: SKIPPED — fm_index.bin already exists");
+    } else {
+        log::info!("Step 4/5: Building FM-index...");
+        fm::build_fm_index_with_ram(&unitigs, output_dir, max_ram_bytes)?;
+    }
 
     // Step 5: Build genome path index
     log::info!("Step 5/5: Building genome path index...");
