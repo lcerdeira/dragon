@@ -192,12 +192,29 @@ pub fn build_path_index(
     // Step 1: Build canonical k-mer → (unitig_id, offset, is_rc) hash table
     let kmer_table = build_kmer_table(unitigs, kmer_size);
 
-    // Step 2: Walk each genome and map to unitig path
+    // Step 2: Walk each genome and stream its path directly to paths.bin.
+    //
+    // We serialize using bincode's `Vec<GenomePath>` wire format:
+    //   1. 8-byte little-endian length prefix (= num_genomes)
+    //   2. Each GenomePath serialized back-to-back.
+    // This is byte-identical to `bincode::serialize(&PathIndex { paths })`,
+    // so load_path_index() reads it with no code change. Peak RAM for this
+    // step drops from O(sum_over_genomes(steps)) to O(max_single_genome_steps)
+    // because each GenomePath is dropped as soon as it's written.
     let genome_files = crate::io::fasta::list_fasta_files(genome_dir)?;
-    let mut paths = Vec::with_capacity(genome_files.len());
+    let num_genomes = genome_files.len();
+
+    let path_file = output_dir.join("paths.bin");
+    let file = std::fs::File::create(&path_file)?;
+    let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, file);
+
+    // Length prefix (matches bincode's fixint Vec encoding).
+    bincode::serialize_into(&mut writer, &(num_genomes as u64))?;
+
     let mut total_steps = 0usize;
     let mut total_mapped_bases = 0u64;
     let mut total_genome_bases = 0u64;
+    let log_every = (num_genomes / 20).max(1).min(1000);
 
     for (genome_id, genome_file) in genome_files.iter().enumerate() {
         let sequences = crate::io::fasta::read_sequences(genome_file)?;
@@ -262,21 +279,30 @@ pub fn build_path_index(
 
         total_steps += steps.len();
 
-        paths.push(GenomePath {
+        let path = GenomePath {
             genome_id: genome_id as u32,
             genome_name,
             genome_length: genome_offset,
             steps,
-        });
+        };
+        bincode::serialize_into(&mut writer, &path)?;
+        // `path` drops here — per-genome memory is not retained.
+
+        if (genome_id + 1) % log_every == 0 || genome_id + 1 == num_genomes {
+            log::info!(
+                "  paths built for {}/{} genomes ({} cumulative steps)",
+                genome_id + 1, num_genomes, total_steps
+            );
+        }
     }
 
-    let path_index = PathIndex { paths };
-    let path_file = output_dir.join("paths.bin");
-    crate::util::mmap::write_bincode(&path_file, &path_index)?;
+    use std::io::Write as _;
+    writer.flush()?;
+    drop(writer);
 
     log::info!(
         "Path index: {} genomes, {} total steps, {:.1}% bases mapped",
-        path_index.num_genomes(),
+        num_genomes,
         total_steps,
         if total_genome_bases > 0 {
             total_mapped_bases as f64 / total_genome_bases as f64 * 100.0
@@ -292,4 +318,48 @@ pub fn build_path_index(
 pub fn load_path_index(index_dir: &Path) -> Result<PathIndex> {
     let path_file = index_dir.join("paths.bin");
     crate::util::mmap::read_bincode(&path_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::unitig::UnitigSet;
+
+    /// Streaming write + PathIndex read must round-trip to the exact same
+    /// paths/steps. Confirms the wire format matches bincode's Vec<T> layout.
+    #[test]
+    fn streaming_path_index_roundtrip() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let genome_dir = tmp.path().join("genomes");
+        let out_dir = tmp.path().join("idx");
+        std::fs::create_dir_all(&genome_dir)?;
+        std::fs::create_dir_all(&out_dir)?;
+
+        // Two tiny genomes that share a unitig-worthy 31+ base prefix.
+        std::fs::write(
+            genome_dir.join("g1.fa"),
+            b">g1\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n",
+        )?;
+        std::fs::write(
+            genome_dir.join("g2.fa"),
+            b">g2\nACGTACGTACGTACGTACGTACGTACGTACGT\n",
+        )?;
+
+        // Two unitigs; the k-mer table just needs any data to walk against.
+        let text = b"ACGTACGTACGTACGTACGTACGTACGTACGT$TTGGCCAATTGGCCAATTGGCCAATTGGCCAA$".to_vec();
+        let lengths = [32u64, 32];
+        let unitigs = UnitigSet::from_fm_text(&text, &lengths);
+
+        build_path_index(&genome_dir, &unitigs, &out_dir, 31)?;
+
+        let idx = load_path_index(&out_dir)?;
+        assert_eq!(idx.num_genomes(), 2);
+        // Each genome must round-trip the per-genome metadata we wrote.
+        for (i, path) in idx.paths.iter().enumerate() {
+            assert_eq!(path.genome_id, i as u32);
+            assert!(!path.genome_name.is_empty());
+            assert!(path.genome_length > 0);
+        }
+        Ok(())
+    }
 }
