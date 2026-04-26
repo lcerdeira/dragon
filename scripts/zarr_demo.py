@@ -3,32 +3,62 @@
 
 This script demonstrates the paper claim that a Dragon index exported with
 `dragon export-zarr` is readable from any Zarr-aware tool — no Dragon code or
-Rust runtime needed.
+Rust runtime needed. Works against local paths and remote object stores.
 
 Requires:
-    pip install zarr>=3.0 numcodecs
+    pip install 'zarr>=3.0' numcodecs                       # local
+    pip install 'zarr>=3.0' numcodecs s3fs                  # also for s3://
+    pip install 'zarr>=3.0' numcodecs gcsfs                 # also for gs://
 
 Usage:
-    dragon export-zarr -i /path/to/index -o /path/to/store.zarr
     python scripts/zarr_demo.py /path/to/store.zarr
+    python scripts/zarr_demo.py s3://dragon-zarr/smoke/idx.zarr
+    python scripts/zarr_demo.py gs://bucket/path/idx.zarr
 """
 
 import sys
-from pathlib import Path
+import time
 
 try:
     import zarr
     import numpy as np
 except ImportError:
-    print("ERROR: install zarr and numpy first: pip install 'zarr>=3.0' numpy", file=sys.stderr)
+    print("ERROR: pip install 'zarr>=3.0' numpy", file=sys.stderr)
     sys.exit(1)
 
 
-def main(store_path: str) -> None:
-    store = zarr.open(store_path, mode="r")
+def open_store(uri: str):
+    """Return a zarr group for either a local path or remote URI."""
+    if uri.startswith(("s3://", "gs://", "az://", "abfs://", "http://", "https://")):
+        try:
+            import fsspec
+        except ImportError:
+            print(
+                "ERROR: remote URIs require fsspec + a backend\n"
+                "       s3fs (s3://), gcsfs (gs://), adlfs (az://), aiohttp (http://)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        proto = uri.split("://", 1)[0]
+        path = uri[len(proto) + 3:]
+        # Public buckets: anonymous read for reproducibility.
+        kwargs = {"anon": True} if proto in ("s3", "gs") else {}
+        if proto == "s3":
+            kwargs["client_kwargs"] = {"region_name": "eu-west-2"}
+        fs = fsspec.filesystem(proto, **kwargs)
+        store = zarr.storage.FsspecStore(fs, path=path)
+        return zarr.open_group(store, mode="r")
+    return zarr.open(uri, mode="r")
 
-    attrs = dict(store.attrs)
+
+def main(store_path: str) -> None:
+    t0 = time.perf_counter()
+    g = open_store(store_path)
+    t_open = time.perf_counter() - t0
+
+    attrs = dict(g.attrs)
     print(f"=== Dragon Zarr store: {store_path} ===")
+    print(f"  open latency    : {t_open*1000:.1f} ms")
     print(f"  format_version  : {attrs.get('dragon_zarr_format_version')}")
     print(f"  kmer_size       : {attrs.get('kmer_size')}")
     print(f"  num_unitigs     : {attrs.get('num_unitigs')}")
@@ -37,28 +67,30 @@ def main(store_path: str) -> None:
     print(f"  num_suffixes    : {attrs.get('num_suffixes')}")
     print()
 
-    text = store["text"]
-    sa = store["suffix_array"]
-    lengths = store["unitig_lengths"][:]
+    text = g["text"]
+    sa = g["suffix_array"]
+    lengths = g["unitig_lengths"][:]
     print("=== Array descriptors ===")
     for name, arr in (("/text", text), ("/suffix_array", sa), ("/unitig_lengths", lengths)):
         if hasattr(arr, "shape"):
-            print(f"  {name:<24} shape={arr.shape} dtype={arr.dtype} chunks={getattr(arr, 'chunks', '-')}")
+            print(f"  {name:<24} shape={arr.shape} dtype={arr.dtype}")
         else:
             print(f"  {name:<24} numpy array shape={arr.shape} dtype={arr.dtype}")
     print()
 
-    # Demonstrate chunked random access: pull the first 128 bases of the
-    # concatenated text without decompressing the whole array.
+    # Chunked random read latency — paper-relevant number.
     n = min(128, int(attrs.get("text_len", 0)))
     if n > 0:
+        t0 = time.perf_counter()
         chunk = bytes(text[:n])
+        t_read = time.perf_counter() - t0
         try:
             preview = chunk.decode("ascii", errors="replace")
         except Exception:
             preview = repr(chunk)
-        print(f"=== First {n} bases of /text (chunked read) ===")
+        print(f"=== First {n} bases of /text (chunked decompressing read) ===")
         print(preview)
+        print(f"  read latency    : {t_read*1000:.1f} ms")
         print()
 
     # Walk the first few unitigs using the cumulative-length array.
@@ -73,6 +105,6 @@ def main(store_path: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: zarr_demo.py <store.zarr>", file=sys.stderr)
+        print("Usage: zarr_demo.py <store.zarr | s3://... | gs://...>", file=sys.stderr)
         sys.exit(2)
     main(sys.argv[1])
