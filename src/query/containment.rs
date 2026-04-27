@@ -108,36 +108,61 @@ pub fn containment_rank(
                 }
             }
 
-            // For each unique unitig hit, credit the genomes that contain it
+            // CRITICAL: deserialize each unitig's color set EXACTLY ONCE per
+            // k-mer. The previous implementation re-deserialized inside a
+            // triple-nested loop (kmer × unitig × genome × seed), producing
+            // billions of small RoaringBitmap allocations and 100+ GB of
+            // allocator pressure on indices with ≥10K genomes. See issue #4.
+            let unitig_color_map: HashMap<u32, RoaringBitmap> = hit_unitigs
+                .iter()
+                .filter_map(|uid| {
+                    color_index.get_colors(uid).ok().map(|c| (uid, c))
+                })
+                .collect();
+
+            // Pre-group seeds by their unitig_id so we can look up "which
+            // seeds are in this genome" without an inner color lookup.
+            let mut seeds_by_unitig: HashMap<u32, Vec<&SeedHit>> = HashMap::new();
+            for seed in &unitig_seeds {
+                seeds_by_unitig.entry(seed.unitig_id).or_default().push(seed);
+            }
+
+            // For each unique unitig hit, credit the genomes that contain it.
             for unitig_id in hit_unitigs.iter() {
-                if let Ok(colors) = color_index.get_colors(unitig_id) {
-                    let cardinality = colors.len();
-                    let ic = if cardinality > 0 && total_genomes > 0 {
-                        (total_genomes as f64 / cardinality as f64).log2()
-                    } else {
-                        0.0
-                    };
+                let colors = match unitig_color_map.get(&unitig_id) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let cardinality = colors.len();
+                let ic = if cardinality > 0 && total_genomes > 0 {
+                    (total_genomes as f64 / cardinality as f64).log2()
+                } else {
+                    0.0
+                };
 
-                    // Only count this query position once per genome
-                    let actual_qpos = if is_reverse {
-                        seq.len() - qpos - kmer_size
-                    } else {
-                        qpos
-                    };
+                let actual_qpos = if is_reverse {
+                    seq.len() - qpos - kmer_size
+                } else {
+                    qpos
+                };
 
-                    for genome_id in colors.iter() {
-                        if !counted_positions[actual_qpos] {
-                            *genome_shared.entry(genome_id).or_insert(0) += 1;
-                        }
-                        *genome_info.entry(genome_id).or_insert(0.0) += ic;
+                for genome_id in colors.iter() {
+                    if !counted_positions[actual_qpos] {
+                        *genome_shared.entry(genome_id).or_insert(0) += 1;
+                    }
+                    *genome_info.entry(genome_id).or_insert(0.0) += ic;
 
-                        // Store seeds for later alignment
-                        for seed in &unitig_seeds {
-                            if color_index.get_colors(seed.unitig_id)
-                                .map(|c| c.contains(genome_id))
-                                .unwrap_or(false)
-                            {
-                                genome_seeds.entry(genome_id).or_default().push(seed.clone());
+                    // For each unitig hit by this k-mer, push its seeds into
+                    // this genome's bucket — but only for unitigs the genome
+                    // actually carries. Membership check is O(1) against the
+                    // pre-built map, no further disk reads.
+                    for (other_uid, other_seeds) in &seeds_by_unitig {
+                        if let Some(other_colors) = unitig_color_map.get(other_uid) {
+                            if other_colors.contains(genome_id) {
+                                let bucket = genome_seeds.entry(genome_id).or_default();
+                                for s in other_seeds {
+                                    bucket.push((*s).clone());
+                                }
                             }
                         }
                     }
