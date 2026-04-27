@@ -63,7 +63,18 @@ impl fmt::Display for PafRecord {
 }
 
 /// Write PAF records to a writer.
+///
+/// Emits a `#`-prefixed header line first describing the 12 mandatory PAF
+/// columns. Standard PAF spec is headerless; the `#` comment makes the
+/// file self-documenting while remaining compatible with minimap2-style
+/// parsers, which skip lines starting with `#`.
 pub fn write_paf<W: Write>(writer: &mut W, records: &[PafRecord]) -> std::io::Result<()> {
+    writeln!(
+        writer,
+        "#query_name\tquery_len\tquery_start\tquery_end\tstrand\t\
+         target_name\ttarget_len\ttarget_start\ttarget_end\t\
+         num_matches\talignment_len\tmapq\ttags..."
+    )?;
     for record in records {
         writeln!(writer, "{}", record)?;
     }
