@@ -152,21 +152,10 @@ fn test_kmer_extraction() {
 // Data structure tests
 // ============================================================================
 
-#[test]
-fn test_varint_roundtrip_many_values() {
-    let values: Vec<u64> = (0..1000).map(|i| i * i * 137).collect();
-    let encoded = dragon::ds::varint::encode_varint_slice(&values);
-    let decoded = dragon::ds::varint::decode_varint_slice(&encoded, values.len());
-    assert_eq!(decoded, values);
-}
-
-#[test]
-fn test_delta_encoding_sorted() {
-    let values: Vec<u64> = (0..500).map(|i| i * 7 + 3).collect();
-    let encoded = dragon::ds::varint::delta_encode(&values);
-    let decoded = dragon::ds::varint::delta_decode(&encoded, values.len());
-    assert_eq!(decoded, values);
-}
+// ds::varint module was removed in commit 33ba145 — its only consumer
+// (paths_v2) ships its own inline LEB128. The two tests previously here
+// (test_varint_roundtrip_many_values, test_delta_encoding_sorted) now live
+// inside paths_v2::tests::varint_roundtrip.
 
 #[test]
 fn test_elias_fano_many_unitigs() {

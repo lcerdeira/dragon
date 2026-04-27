@@ -353,6 +353,21 @@ enum Commands {
         #[arg(short, long, default_value = "-")]
         output: String,
     },
+
+    /// Migrate a legacy bincode `paths.bin` to the mmap-friendly v2 format.
+    ///
+    /// Indices built before commit a70a087 store paths.bin as a bincode-
+    /// serialised `Vec<GenomePath>` that must be slurped into RAM in full
+    /// at search time — for shards >50 GB this OOMs even on 700 GB nodes.
+    /// This subcommand stream-converts the file in place (memory-bounded
+    /// by the largest single genome's path) and renames the original to
+    /// `paths.bin.legacy` for rollback. After migration, search loads the
+    /// shard's path index in O(1) via mmap.
+    MigratePaths {
+        /// Path to a Dragon index directory containing a paths.bin file.
+        #[arg(short, long)]
+        index: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1316,6 +1331,22 @@ echo "  Download complete."
                         writeln!(writer, "{}\t{}\t{}\t{}\t{}", rec.name, n, uid, off, genomes.join(","))?;
                     }
                 }
+            }
+        }
+
+        Commands::MigratePaths { index } => {
+            log::info!("Migrating paths.bin in {:?} to v2 format", index);
+            let stats = dragon::index::paths::migrate_paths_to_v2(&index)?;
+            if stats.already_v2 {
+                log::info!("paths.bin already in v2 format — nothing to do");
+            } else {
+                let old_gb = stats.old_size as f64 / 1_073_741_824.0;
+                let new_gb = stats.new_size as f64 / 1_073_741_824.0;
+                let saved = old_gb - new_gb;
+                log::info!(
+                    "Migrated {} genomes: {:.2} GB -> {:.2} GB ({:.2} GB saved); legacy backup at paths.bin.legacy",
+                    stats.num_genomes, old_gb, new_gb, saved
+                );
             }
         }
     }
