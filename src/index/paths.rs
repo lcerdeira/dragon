@@ -145,6 +145,19 @@ impl PathIndex {
     }
 
     /// Extract sequence from a GenomePath directly (no PathIndex lookup needed).
+    ///
+    /// In a colored compacted de Bruijn graph, consecutive unitigs traversed
+    /// by a genome path share (k-1) bases at the seam — that's how dBG
+    /// compaction works. So a path step of unitig_len L only contributes
+    /// L bp of *new* genome the first time it appears in a chain; on every
+    /// subsequent step that overlaps the previous one, the first
+    /// (prev_step_end - this_step_start) bases are duplicates and must be
+    /// skipped.
+    ///
+    /// Without this correction, extract_sequence_static returns up to ~3×
+    /// the requested window for typical 45 bp unitigs with k=31 overlap,
+    /// which feeds WFA a reference full of duplicated regions and produces
+    /// nonsense CIGARs full of huge D ops.
     pub fn extract_sequence_static(
         path: &GenomePath,
         start: u64,
@@ -152,6 +165,10 @@ impl PathIndex {
         unitigs: &UnitigSet,
     ) -> Vec<u8> {
         let mut result = Vec::with_capacity((end - start) as usize);
+        // Track where in genome coordinates we have already emitted up to,
+        // so we can skip duplicated boundary k-mers between consecutive
+        // overlapping steps.
+        let mut emitted_up_to: Option<u64> = None;
 
         for step in &path.steps {
             let unitig_len = unitigs.unitigs.get(step.unitig_id as usize)
@@ -163,8 +180,23 @@ impl PathIndex {
                 continue;
             }
 
-            let overlap_start = start.max(step.genome_offset);
+            // Default overlap: clamp the step's interval to [start, end].
+            let mut overlap_start = start.max(step.genome_offset);
             let overlap_end = end.min(step_end);
+
+            // If the previous emitted segment already covered some of this
+            // step's range (k-1 boundary overlap with the prior unitig in
+            // the path), skip ahead to where we left off.
+            if let Some(prev_end) = emitted_up_to {
+                if prev_end > overlap_start {
+                    overlap_start = prev_end;
+                }
+            }
+
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
             let local_start = (overlap_start - step.genome_offset) as usize;
             let local_end = (overlap_end - step.genome_offset) as usize;
 
@@ -182,6 +214,7 @@ impl PathIndex {
             }
 
             result.extend_from_slice(&subseq);
+            emitted_up_to = Some(overlap_end);
         }
 
         result
