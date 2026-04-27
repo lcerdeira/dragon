@@ -153,14 +153,25 @@ pub fn containment_rank(
                     *genome_info.entry(genome_id).or_insert(0.0) += ic;
 
                     // For each unitig hit by this k-mer, push its seeds into
-                    // this genome's bucket — but only for unitigs the genome
-                    // actually carries. Membership check is O(1) against the
-                    // pre-built map, no further disk reads.
+                    // this genome's bucket — but cap the bucket. direct_align
+                    // only needs a handful of anchor seeds per candidate; with
+                    // 16K-genome × 1K-unitig × 50-kmer queries, an uncapped
+                    // bucket grows to tens of GB and OOMs the process.
+                    const MAX_SEEDS_PER_GENOME: usize = 64;
+                    let bucket = genome_seeds.entry(genome_id).or_default();
+                    if bucket.len() >= MAX_SEEDS_PER_GENOME {
+                        continue;
+                    }
                     for (other_uid, other_seeds) in &seeds_by_unitig {
+                        if bucket.len() >= MAX_SEEDS_PER_GENOME {
+                            break;
+                        }
                         if let Some(other_colors) = unitig_color_map.get(other_uid) {
                             if other_colors.contains(genome_id) {
-                                let bucket = genome_seeds.entry(genome_id).or_default();
                                 for s in other_seeds {
+                                    if bucket.len() >= MAX_SEEDS_PER_GENOME {
+                                        break;
+                                    }
                                     bucket.push((*s).clone());
                                 }
                             }
