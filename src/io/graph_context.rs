@@ -64,12 +64,12 @@ pub fn extract_hit_subgraphs(
         // target_name is "genome_{id}" (from align.rs); match by genome_id or name.
         let genome_path = if let Some(id_str) = record.target_name.strip_prefix("genome_") {
             if let Ok(gid) = id_str.parse::<u32>() {
-                path_index.paths.iter().find(|p| p.genome_id == gid)
+                path_index.get_path(gid)
             } else {
-                path_index.paths.iter().find(|p| p.genome_name == record.target_name)
+                path_index.iter().find(|p| p.genome_name == record.target_name)
             }
         } else {
-            path_index.paths.iter().find(|p| p.genome_name == record.target_name)
+            path_index.iter().find(|p| p.genome_name == record.target_name)
         };
         let genome_path = match genome_path {
             Some(p) => p,

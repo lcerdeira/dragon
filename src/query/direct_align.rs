@@ -86,12 +86,12 @@ pub fn direct_align_candidates(
         let rev_seeds: Vec<_> = hit.seeds.iter().filter(|s| s.is_reverse).collect();
 
         if let Some(record) = align_with_seeds(
-            query, query_name, &fwd_seeds, hit, genome_path, unitigs, candidates, false,
+            query, query_name, &fwd_seeds, hit, &genome_path, unitigs, candidates, false,
         ) {
             records.push(record);
         }
         if let Some(record) = align_with_seeds(
-            query, query_name, &rev_seeds, hit, genome_path, unitigs, candidates, true,
+            query, query_name, &rev_seeds, hit, &genome_path, unitigs, candidates, true,
         ) {
             records.push(record);
         }

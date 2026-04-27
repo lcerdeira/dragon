@@ -24,11 +24,11 @@ It exploits the redundancy among related genomes through:
 |---|---|---|---|---|
 | **Disk (2M genomes)** | ~100 GB | 5,460 GB | scales linearly | scales linearly |
 | **Query RAM** | <4 GB | 4–25 GB | scales linearly | scales linearly |
-| **Multi-shard search** | ✅ `--shard` | ❌ | ❌ | ❌ |
-| **Cloud-native (S3 random read)** | ✅ Zarr v3 | ❌ | ❌ | ❌ |
-| **Raw nanopore signal search** | ✅ | ❌ | ❌ | ❌ |
-| **Per-species surveillance summary** | ✅ | ❌ | ❌ | ❌ |
-| **Hardware profile (laptop mode)** | ✅ | ❌ | partial | partial |
+| **Multi-shard search** | Yes `--shard` | No | No | No |
+| **Cloud-native (S3 random read)** | Yes / Zarr v3 | No | No | No |
+| **Raw nanopore signal search** | Yes | No | No | No |
+| **Per-species surveillance summary** | Yes | No | No | No |
+| **Hardware profile (laptop mode)** | Yes | No | partial | partial |
 
 A 16,000-genome demo index lives at `s3://dragon-zarr/saureus/b1/` (eu-west-2, public-read). No credentials needed:
 

@@ -1,7 +1,7 @@
 /// Genome path index: stores each genome as a sequence of unitig IDs
 /// traversed when walking the genome through the de Bruijn graph.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,18 +29,67 @@ pub struct PathStep {
 }
 
 /// Collection of all genome paths.
+///
+/// Two backings are supported:
+///   * `Eager` — legacy bincode `Vec<GenomePath>` loaded fully into RAM.
+///     Used when `paths.bin` predates the v2 format.
+///   * `Mmap`  — v2 file mmap'd lazily; per-genome blobs are decoded on
+///     demand. O(1) load time, O(touched genomes × steps) RAM at query time.
+///
+/// Public API yields **owned** `GenomePath` values so the same code paths
+/// work for both backings (the eager variant clones; the mmap variant
+/// decodes from the mmap region).
+#[derive(Clone)]
+pub enum PathIndex {
+    /// All genomes pre-decoded into RAM.
+    Eager(std::sync::Arc<Vec<GenomePath>>),
+    /// Lazy v2 view; only the offset table is mmap-resident at idle.
+    Mmap(std::sync::Arc<crate::index::paths_v2::MmapPathIndex>),
+}
+
+/// Bincode-friendly shadow type for the legacy on-disk format. Keeping the
+/// `paths` Vec layout means existing bincode files (and the
+/// `crate::util::mmap::write_bincode(&PathIndex, ...)` test helper) keep
+/// working unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PathIndex {
-    pub paths: Vec<GenomePath>,
+struct LegacyPathIndex {
+    paths: Vec<GenomePath>,
 }
 
 impl PathIndex {
-    pub fn get_path(&self, genome_id: u32) -> Option<&GenomePath> {
-        self.paths.get(genome_id as usize)
+    /// Build an eager index from a fully materialized `Vec<GenomePath>`.
+    pub fn from_paths(paths: Vec<GenomePath>) -> Self {
+        Self::Eager(std::sync::Arc::new(paths))
+    }
+
+    /// Decode the i-th genome. Returns owned data — for the mmap variant
+    /// this allocates a `Vec<PathStep>` for the requested genome only.
+    pub fn get_path(&self, genome_id: u32) -> Option<GenomePath> {
+        match self {
+            Self::Eager(v) => v.get(genome_id as usize).cloned(),
+            Self::Mmap(m) => m.get_path(genome_id).ok().flatten(),
+        }
     }
 
     pub fn num_genomes(&self) -> usize {
-        self.paths.len()
+        match self {
+            Self::Eager(v) => v.len(),
+            Self::Mmap(m) => m.num_genomes() as usize,
+        }
+    }
+
+    /// Iterate every genome path. Yields owned values; the mmap variant
+    /// decodes lazily and is suitable even for huge indices because each
+    /// item is dropped before the next is decoded.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = GenomePath> + '_> {
+        match self {
+            Self::Eager(v) => Box::new(v.iter().cloned()),
+            Self::Mmap(m) => {
+                let n = m.num_genomes();
+                let m = m.clone();
+                Box::new((0..n).filter_map(move |gid| m.get_path(gid as u32).ok().flatten()))
+            }
+        }
     }
 
     /// Extract the reference sequence for a region of a genome by walking its path.
@@ -316,27 +365,23 @@ pub fn build_path_index(
 /// Load the path index from disk. Backwards-compatible: dispatches on the
 /// file magic so old (bincode) and new (paths_v2 mmap) formats both work.
 ///
-/// For new code that wants O(1) load time and per-genome lazy decoding, use
-/// [`open_path_index_mmap`] instead — this function eagerly materializes
-/// every genome into RAM for compatibility with legacy callers.
+/// **Memory behaviour matters here:**
+///   * v2 files load in O(1) — only the file is mmap'd. Per-genome blobs
+///     are decoded lazily by [`PathIndex::get_path`] / [`PathIndex::iter`].
+///   * Legacy bincode files are eagerly slurped into a `Vec<GenomePath>`
+///     because their on-disk layout offers no random-access table. For
+///     huge legacy files (>50 GB) this can OOM — run [`migrate_paths_to_v2`]
+///     first.
 pub fn load_path_index(index_dir: &Path) -> Result<PathIndex> {
     let path_file = index_dir.join("paths.bin");
     if crate::index::paths_v2::is_v2(&path_file)? {
-        // Eagerly decode all genomes — preserves the legacy in-memory shape.
-        // Hot-path consumers should switch to open_path_index_mmap().
         let mmap_idx = crate::index::paths_v2::MmapPathIndex::open(&path_file)?;
-        let n = mmap_idx.num_genomes();
-        let mut paths = Vec::with_capacity(n as usize);
-        for gid in 0..n {
-            let p = mmap_idx
-                .get_path(gid as u32)?
-                .ok_or_else(|| anyhow::anyhow!("missing genome {gid}"))?;
-            paths.push(p);
-        }
-        Ok(PathIndex { paths })
+        Ok(PathIndex::Mmap(std::sync::Arc::new(mmap_idx)))
     } else {
         // Legacy bincode `Vec<GenomePath>` format.
-        crate::util::mmap::read_bincode(&path_file)
+        let legacy: LegacyPathIndex =
+            crate::util::mmap::read_bincode(&path_file)?;
+        Ok(PathIndex::from_paths(legacy.paths))
     }
 }
 
@@ -347,6 +392,92 @@ pub fn open_path_index_mmap(
 ) -> Result<crate::index::paths_v2::MmapPathIndex> {
     let path_file = index_dir.join("paths.bin");
     crate::index::paths_v2::MmapPathIndex::open(&path_file)
+}
+
+/// Migrate a legacy bincode-format `paths.bin` (eager `Vec<GenomePath>`) to
+/// the mmap-friendly v2 format **without ever loading the whole file into RAM**.
+/// Reads one `GenomePath` at a time from the legacy stream and writes each
+/// directly into a fresh v2 file at `<paths>.v2.tmp`, then atomically renames
+/// over the original on success. Peak memory is bounded by the largest single
+/// genome's `Vec<PathStep>`.
+///
+/// This is the migration path for indices built before commit a70a087 — those
+/// `paths.bin` files are typically tens to hundreds of GB and cannot be loaded
+/// eagerly on most hardware. Running this once per shard converts them to a
+/// format `MmapPathIndex` can open in O(1) at query time.
+pub fn migrate_paths_to_v2(index_dir: &Path) -> Result<MigrationStats> {
+    let path_file = index_dir.join("paths.bin");
+    if !path_file.exists() {
+        anyhow::bail!("no paths.bin in {:?}", index_dir);
+    }
+    if crate::index::paths_v2::is_v2(&path_file)? {
+        log::info!("paths.bin in {:?} already v2 — nothing to do", index_dir);
+        return Ok(MigrationStats {
+            num_genomes: 0,
+            old_size: std::fs::metadata(&path_file)?.len(),
+            new_size: std::fs::metadata(&path_file)?.len(),
+            already_v2: true,
+        });
+    }
+
+    log::info!("Migrating legacy paths.bin in {:?} -> v2", index_dir);
+    let old_size = std::fs::metadata(&path_file)?.len();
+
+    // Stream-decode the legacy bincode `Vec<GenomePath>` layout:
+    //   1. u64 length prefix (number of genomes)
+    //   2. concatenated GenomePath records (each variable-length).
+    let f = std::fs::File::open(&path_file)?;
+    let mut reader = std::io::BufReader::with_capacity(16 * 1024 * 1024, f);
+    let num_genomes: u64 = bincode::deserialize_from(&mut reader)
+        .context("read u64 num_genomes prefix from legacy paths.bin")?;
+    log::info!("  legacy file contains {} genomes ({:.1} GB on disk)",
+               num_genomes, old_size as f64 / 1_073_741_824.0);
+
+    // Write to a sibling .tmp file; rename on success.
+    let tmp_file = index_dir.join("paths.bin.v2.tmp");
+    let mut writer =
+        crate::index::paths_v2::PathV2Writer::create(&tmp_file, num_genomes)?;
+
+    let log_every = (num_genomes / 20).max(1).min(1000);
+    for gid in 0..num_genomes {
+        let g: GenomePath = bincode::deserialize_from(&mut reader)
+            .with_context(|| format!("decode genome {gid} from legacy paths.bin"))?;
+        writer.write_genome(&g)?;
+        if (gid + 1) % log_every == 0 || gid + 1 == num_genomes {
+            log::info!("  migrated {}/{} genomes", gid + 1, num_genomes);
+        }
+    }
+    writer.finish()?;
+    let new_size = std::fs::metadata(&tmp_file)?.len();
+
+    // Atomic rename over the original.
+    let backup = index_dir.join("paths.bin.legacy");
+    std::fs::rename(&path_file, &backup)
+        .with_context(|| format!("backup {:?} -> {:?}", path_file, backup))?;
+    std::fs::rename(&tmp_file, &path_file)
+        .with_context(|| format!("install v2 file at {:?}", path_file))?;
+    log::info!(
+        "  migration complete: {:.1} GB -> {:.1} GB (legacy backup at {:?})",
+        old_size as f64 / 1_073_741_824.0,
+        new_size as f64 / 1_073_741_824.0,
+        backup
+    );
+
+    Ok(MigrationStats {
+        num_genomes,
+        old_size,
+        new_size,
+        already_v2: false,
+    })
+}
+
+/// Summary returned by [`migrate_paths_to_v2`].
+#[derive(Debug, Clone)]
+pub struct MigrationStats {
+    pub num_genomes: u64,
+    pub old_size: u64,
+    pub new_size: u64,
+    pub already_v2: bool,
 }
 
 #[cfg(test)]
@@ -384,11 +515,78 @@ mod tests {
         let idx = load_path_index(&out_dir)?;
         assert_eq!(idx.num_genomes(), 2);
         // Each genome must round-trip the per-genome metadata we wrote.
-        for (i, path) in idx.paths.iter().enumerate() {
+        for (i, path) in idx.iter().enumerate() {
             assert_eq!(path.genome_id, i as u32);
             assert!(!path.genome_name.is_empty());
             assert!(path.genome_length > 0);
         }
+        Ok(())
+    }
+
+    /// Manufacture a legacy bincode `paths.bin`, migrate it to v2 in place,
+    /// and confirm that `MmapPathIndex::open` yields byte-identical genomes.
+    #[test]
+    fn migrate_legacy_to_v2_roundtrip() -> Result<()> {
+        use crate::index::paths_v2::MmapPathIndex;
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path();
+
+        // Build a tiny in-memory PathIndex with non-trivial steps so the
+        // delta encoding gets exercised.
+        let mut paths = Vec::new();
+        for gid in 0..3u32 {
+            let mut steps = Vec::new();
+            let mut off = 0u64;
+            for i in 0..(50 + gid as u32 * 25) {
+                steps.push(super::PathStep {
+                    unitig_id: i % 11,
+                    is_reverse: i % 2 == 0,
+                    genome_offset: off,
+                });
+                off += (i as u64 % 31) + 1;
+            }
+            paths.push(super::GenomePath {
+                genome_id: gid,
+                genome_name: format!("g_{gid:04}"),
+                genome_length: off,
+                steps,
+            });
+        }
+        let original_paths = paths.clone();
+        let original = super::LegacyPathIndex { paths };
+
+        // Write a *legacy* bincode paths.bin (the format produced by builds
+        // before commit a70a087 introduced the v2 magic header).
+        let path_file = dir.join("paths.bin");
+        crate::util::mmap::write_bincode(&path_file, &original)?;
+        assert!(!crate::index::paths_v2::is_v2(&path_file)?);
+
+        // Migrate.
+        let stats = migrate_paths_to_v2(dir)?;
+        assert!(!stats.already_v2);
+        assert_eq!(stats.num_genomes, 3);
+        assert!(crate::index::paths_v2::is_v2(&path_file)?);
+        assert!(dir.join("paths.bin.legacy").exists());
+
+        // Read back via MmapPathIndex and compare every step.
+        let mmap_idx = MmapPathIndex::open(&path_file)?;
+        assert_eq!(mmap_idx.num_genomes(), 3);
+        for orig in &original_paths {
+            let got = mmap_idx.get_path(orig.genome_id)?.unwrap();
+            assert_eq!(got.genome_id, orig.genome_id);
+            assert_eq!(got.genome_name, orig.genome_name);
+            assert_eq!(got.genome_length, orig.genome_length);
+            assert_eq!(got.steps.len(), orig.steps.len());
+            for (a, b) in got.steps.iter().zip(orig.steps.iter()) {
+                assert_eq!(a.unitig_id, b.unitig_id);
+                assert_eq!(a.is_reverse, b.is_reverse);
+                assert_eq!(a.genome_offset, b.genome_offset);
+            }
+        }
+
+        // Re-running migration on an already-v2 file should be a no-op.
+        let again = migrate_paths_to_v2(dir)?;
+        assert!(again.already_v2);
         Ok(())
     }
 }
