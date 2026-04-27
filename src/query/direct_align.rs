@@ -23,7 +23,9 @@ use crate::query::containment::ContainmentHit;
 
 /// Padding (bp) added to either side of the seed-defined reference region
 /// before WFA alignment, so the aligner can find the true endpoints.
-const ALIGN_PAD: usize = 100;
+/// Kept small because rust_wfa does GLOBAL alignment — every byte of
+/// reference padding past the actual match becomes a gap operation.
+const ALIGN_PAD: usize = 20;
 
 /// WFA gap-affine penalties (mismatch=4, gap-open=6, gap-extend=2). These
 /// match minimap2's `asm5` profile and are reasonable for divergent
@@ -196,11 +198,17 @@ fn align_with_seeds(
         return None;
     }
 
-    // Pad the reference window. After clustering, this is bounded by
-    // max_cluster_span + 2 · ALIGN_PAD ≈ a few hundred bp for short queries,
-    // a few kb for longer ones — never megabases.
-    let extract_start = ref_min.saturating_sub(ALIGN_PAD as u64);
-    let extract_end = (ref_max + ALIGN_PAD as u64).min(genome_path.genome_length);
+    // Project the reference window to span the FULL query, not just the
+    // seed-covered portion. Anchors give us a "translation" between query
+    // coordinates and ref coordinates; assuming approximate colinearity,
+    // query position 0 lands at ref position (ref_min - query_min) and
+    // query position query.len() lands at (ref_min - query_min + query.len()).
+    // We then add ALIGN_PAD on each side for end-gap slack.
+    let est_ref_start_for_query = ref_min.saturating_sub(query_min as u64);
+    let est_ref_end_for_query = est_ref_start_for_query + query.len() as u64;
+    let extract_start = est_ref_start_for_query.saturating_sub(ALIGN_PAD as u64);
+    let extract_end = (est_ref_end_for_query + ALIGN_PAD as u64)
+        .min(genome_path.genome_length);
 
     log::debug!(
         "[align_with_seeds] genome={} q_len={} anchors={} ref_min={} ref_max={} extract=[{}, {}) win={}",
@@ -250,12 +258,15 @@ fn align_with_seeds(
         ref_seq
     };
 
-    // Slice + orient the query to match the seed strand.
-    let query_slice_end = query_max.min(query.len());
-    if query_slice_end <= query_min {
-        return None;
-    }
-    let mut query_oriented: Vec<u8> = query[query_min..query_slice_end].to_vec();
+    // Align the FULL query (not just the seed-covered portion). Slicing to
+    // query[query_min..query_max] artificially capped query coverage at
+    // (query_max - query_min) / query.len() — typically ~50 % for short
+    // queries — even when the rest of the query was present in the
+    // genome. WFA does global alignment, so giving it the whole query
+    // against a tightly-sized reference window produces meaningful
+    // identity numbers.
+    let mut query_oriented: Vec<u8> = query.to_vec();
+    let query_min_in_align: usize = 0;
     if is_reverse {
         query_oriented = reverse_complement(&query_oriented);
     }
@@ -314,21 +325,25 @@ fn align_with_seeds(
     let target_start = extract_window_start as usize + target_start_in_window;
     let target_end = extract_window_start as usize + target_end_in_window;
 
-    // Query span on the original (un-RC'd) coordinates.
+    // Query span on the original (un-RC'd) coordinates. We now align the
+    // full query (query_min_in_align == 0 after the slicing change above),
+    // so coordinate mapping just needs to undo the reverse-complement when
+    // applicable.
     let q_lead_gap = leading_gap_consumed(&alignment.text_aligned, &alignment.query_aligned);
     let q_aligned_len = stats.query_consumed;
+    let _ = query_min_in_align; // placeholder; full query is always 0..query.len()
     let (final_q_start, final_q_end) = if is_reverse {
-        // We aligned RC(query[query_min..query_slice_end]) against t.
+        // We aligned RC(query) against t.
         // Map back: a RC slice's [a, b) corresponds to original [L-b, L-a)
         // where L = q_str.len().
         let l = q_str.len();
         let a = q_lead_gap;
         let b = a + q_aligned_len;
-        let rc_start = query_min + (l - b);
-        let rc_end = query_min + (l - a);
+        let rc_start = l - b;
+        let rc_end = l - a;
         (rc_start, rc_end)
     } else {
-        (query_min + q_lead_gap, query_min + q_lead_gap + q_aligned_len)
+        (q_lead_gap, q_lead_gap + q_aligned_len)
     };
 
     let alignment_len = stats.alignment_len;
