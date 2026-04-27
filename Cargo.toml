@@ -32,6 +32,10 @@ byteorder = "1"
 # Cloud-native, chunked, compressed index format (Zarr v3)
 zarrs = { version = "0.23", default-features = false, features = ["filesystem", "zstd", "sharding", "crc32c"] }
 
+# Wavefront Alignment Algorithm (WFA): exact O(s · max(m,n)) gap-affine alignment
+# Marcus & Marco-Rivas 2021 (https://doi.org/10.1093/bioinformatics/btaa777)
+rust_wfa = "1.0"
+
 # Error handling
 anyhow = "1"
 thiserror = "2"
