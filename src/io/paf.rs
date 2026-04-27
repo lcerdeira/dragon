@@ -23,11 +23,16 @@ pub struct PafRecord {
 }
 
 impl PafRecord {
+    /// BLAST-style query identity: fraction of the query that matched
+    /// identically. This excludes reference-padding deletions that would
+    /// otherwise depress the score for short queries embedded in a larger
+    /// reference window (Dragon's WFA does global alignment, so any
+    /// padding bp past the actual hit becomes a D op).
     pub fn identity(&self) -> f64 {
-        if self.alignment_len == 0 {
+        if self.query_len == 0 {
             0.0
         } else {
-            self.num_matches as f64 / self.alignment_len as f64
+            self.num_matches as f64 / self.query_len as f64
         }
     }
 }
