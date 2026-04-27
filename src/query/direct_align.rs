@@ -36,6 +36,17 @@ fn default_penalties() -> Penalties {
     }
 }
 
+fn rss_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
 /// Align a query directly against top candidate genomes.
 pub fn direct_align_candidates(
     query: &[u8],
@@ -46,8 +57,17 @@ pub fn direct_align_candidates(
     max_candidates: usize,
 ) -> Vec<PafRecord> {
     let mut records = Vec::new();
+    let to_process = candidates.len().min(max_candidates);
+    log::info!("[direct_align] entering with {} candidates ({} considered)",
+               candidates.len(), to_process);
+    if let Some(mb) = rss_mb() { log::info!("[direct_align] RSS={} MB", mb); }
 
-    for hit in candidates.iter().take(max_candidates) {
+    for (i, hit) in candidates.iter().take(max_candidates).enumerate() {
+        if i % 10 == 0 {
+            if let Some(mb) = rss_mb() {
+                log::info!("[direct_align] candidate {}/{} RSS={} MB", i, to_process, mb);
+            }
+        }
         let genome_path = match path_index.get_path(hit.genome_id) {
             Some(p) => p,
             None => continue,
