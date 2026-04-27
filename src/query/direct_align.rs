@@ -201,6 +201,18 @@ fn align_with_seeds(
     // a few kb for longer ones — never megabases.
     let extract_start = ref_min.saturating_sub(ALIGN_PAD as u64);
     let extract_end = (ref_max + ALIGN_PAD as u64).min(genome_path.genome_length);
+
+    log::debug!(
+        "[align_with_seeds] genome={} q_len={} anchors={} ref_min={} ref_max={} extract=[{}, {}) win={}",
+        hit.genome_id,
+        query.len(),
+        anchors.len(),
+        ref_min,
+        ref_max,
+        extract_start,
+        extract_end,
+        extract_end.saturating_sub(extract_start),
+    );
     let ref_seq = PathIndex::extract_sequence_static(
         genome_path,
         extract_start,
@@ -210,6 +222,33 @@ fn align_with_seeds(
     if ref_seq.is_empty() {
         return None;
     }
+    log::debug!(
+        "[align_with_seeds] genome={} ref_seq.len()={}",
+        hit.genome_id, ref_seq.len()
+    );
+
+    // Hard cap on the alignment text size: never feed WFA more than
+    // 4 · query.len() of reference. If extract_sequence_static produced
+    // more than that (e.g. because path steps overlap or expanded
+    // unexpectedly), trim the reference to a window centred on the
+    // anchor cluster's median in target-window coordinates.
+    let max_ref_len = (query.len() * 4).max(400);
+    let ref_seq = if ref_seq.len() > max_ref_len {
+        let median_in_window = (ref_min - extract_start) as usize;
+        let half = max_ref_len / 2;
+        let lo = median_in_window.saturating_sub(half);
+        let hi = (lo + max_ref_len).min(ref_seq.len());
+        log::debug!(
+            "[align_with_seeds] trimmed ref_seq from {} -> {} bp (window {}..{})",
+            ref_seq.len(),
+            hi - lo,
+            lo,
+            hi
+        );
+        ref_seq[lo..hi].to_vec()
+    } else {
+        ref_seq
+    };
 
     // Slice + orient the query to match the seed strand.
     let query_slice_end = query_max.min(query.len());
