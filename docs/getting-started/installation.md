@@ -19,7 +19,7 @@ source $HOME/.cargo/env
 ### 2. Clone and build
 
 ```bash
-git clone https://github.com/dragon-aligner/dragon.git
+git clone https://github.com/lcerdeira/dragon.git
 cd dragon
 cargo build --release
 ```
@@ -48,22 +48,31 @@ dragon --help
 [GGCAT](https://github.com/algbio/ggcat) provides optimised coloured compacted de Bruijn graph construction. Dragon will use it automatically if found in `PATH`.
 
 ```bash
-# Install via cargo
-cargo install ggcat
-
-# Or build from source
+# Build from source (GGCAT is not on crates.io)
 git clone https://github.com/algbio/ggcat.git
 cd ggcat
 cargo build --release
+cp target/release/ggcat ~/.cargo/bin/   # or anywhere on $PATH
 ```
 
 Without GGCAT, Dragon uses a built-in graph builder that works well for datasets up to ~10,000 genomes.
 
-### Benchmark dependencies
+### Cloud-native (Zarr) dependencies
 
-To run the benchmark pipeline:
+To read Dragon Zarr stores from Python (local paths or `s3://` / `gs://`):
 
 ```bash
+pip install 'zarr>=3.0' s3fs gcsfs numcodecs
+```
+
+A 16,000-genome demo store lives at `s3://dragon-zarr/saureus/b1/` (eu-west-2, public-read; no AWS credentials required).
+
+### Benchmark dependencies
+
+The benchmark pipeline now lives in the companion repository `lcerdeira/dragon-private` (private until publication). If you have access:
+
+```bash
+git clone https://github.com/lcerdeira/dragon-private.git
 pip install snakemake matplotlib seaborn pandas numpy
 ```
 
