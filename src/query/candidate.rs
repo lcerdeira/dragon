@@ -47,40 +47,44 @@ pub fn find_candidates(
 ) -> Vec<Candidate> {
     let total_genomes = color_index.num_genomes();
 
-    // Accumulate both weighted scores and raw counts per genome
+    // Accumulate both weighted scores and raw counts per genome.
     let mut vote_scores: HashMap<u32, f64> = HashMap::new();
     let mut vote_counts: HashMap<u32, u32> = HashMap::new();
     let mut genome_seeds: HashMap<u32, Vec<SeedHit>> = HashMap::new();
 
-    // Track unique unitigs to avoid double-counting votes
-    let mut seen_unitigs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // direct_align only uses a handful of anchors per candidate; storing
+    // every (seed, genome) pair OOMs at 16K-genome shard scale.
+    // Reproducer: 59 bp ermC × 500K seeds × 16K genomes per shared k-mer
+    // = ~8B SeedHit clones (≈250 GB). Cap fixes issue #4 part 2.
+    const MAX_SEEDS_PER_GENOME: usize = 64;
 
-    for seed in seeds {
-        if !seen_unitigs.insert(seed.unitig_id) {
-            // Already counted this unitig, but still record the seed
-            if let Ok(colors) = color_index.get_colors(seed.unitig_id) {
-                for genome_id in colors.iter() {
-                    genome_seeds
-                        .entry(genome_id)
-                        .or_default()
-                        .push(seed.clone());
+    // Group seeds by unitig_id once so we can call get_colors a single time
+    // per unique unitig instead of redundantly per seed.
+    let mut by_unitig: HashMap<u32, Vec<&SeedHit>> = HashMap::new();
+    for s in seeds {
+        by_unitig.entry(s.unitig_id).or_default().push(s);
+    }
+
+    for (unitig_id, unitig_seeds) in &by_unitig {
+        let colors = match color_index.get_colors(*unitig_id) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let cardinality = colors.len();
+        let ic = information_content(cardinality, total_genomes);
+
+        for genome_id in colors.iter() {
+            *vote_scores.entry(genome_id).or_insert(0.0) += ic;
+            *vote_counts.entry(genome_id).or_insert(0) += 1;
+            let bucket = genome_seeds.entry(genome_id).or_default();
+            // Push at most MAX_SEEDS_PER_GENOME anchors total for this genome.
+            // First seeds win — typically the longest match-length seeds
+            // because find_seeds emits them in extension-length order.
+            for s in unitig_seeds {
+                if bucket.len() >= MAX_SEEDS_PER_GENOME {
+                    break;
                 }
-            }
-            continue;
-        }
-
-        // Look up which genomes contain this unitig
-        if let Ok(colors) = color_index.get_colors(seed.unitig_id) {
-            let cardinality = colors.len();
-            let ic = information_content(cardinality, total_genomes);
-
-            for genome_id in colors.iter() {
-                *vote_scores.entry(genome_id).or_insert(0.0) += ic;
-                *vote_counts.entry(genome_id).or_insert(0) += 1;
-                genome_seeds
-                    .entry(genome_id)
-                    .or_default()
-                    .push(seed.clone());
+                bucket.push((*s).clone());
             }
         }
     }
