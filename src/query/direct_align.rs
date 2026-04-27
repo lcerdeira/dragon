@@ -216,10 +216,7 @@ fn align_with_seeds(
     // Compute genome-coordinate target span from the leading/trailing
     // text-side gaps so target_start/target_end describe only the aligned
     // portion (not the padded extraction window).
-    let text_lead_gap = leading_gap(&alignment.query_aligned);
     let text_lead_in_ref = leading_gap_consumed(&alignment.query_aligned, &alignment.text_aligned);
-    let text_trail_in_ref =
-        trailing_gap_consumed(&alignment.query_aligned, &alignment.text_aligned);
 
     // text-side leading skip = bases of t consumed before the alignment proper begins
     let aligned_target_len = stats.target_consumed;
@@ -261,7 +258,6 @@ fn align_with_seeds(
     } else {
         num_matches as f64 / alignment_len as f64
     };
-    let _ = text_lead_gap; // currently unused; kept for clarity / future use
 
     let mut tags = containment_tags(hit, query.len());
     tags.push(format!("NM:i:{}", stats.edits));
@@ -379,28 +375,12 @@ impl AlignmentStats {
     }
 }
 
-/// Leading positions where `s` is filled with '-' characters.
-fn leading_gap(s: &str) -> usize {
-    s.bytes().take_while(|&c| c == b'-').count()
-}
-
 /// Number of bases consumed from `consumed` while `gapped` is leading-gap.
 /// E.g. consumed = "ACGT...", gapped = "----..." → returns 4.
 fn leading_gap_consumed(gapped: &str, consumed: &str) -> usize {
     gapped
         .bytes()
         .zip(consumed.bytes())
-        .take_while(|&(g, _)| g == b'-')
-        .filter(|&(_, c)| c != b'-')
-        .count()
-}
-
-/// Same but trailing.
-fn trailing_gap_consumed(gapped: &str, consumed: &str) -> usize {
-    gapped
-        .bytes()
-        .rev()
-        .zip(consumed.bytes().rev())
         .take_while(|&(g, _)| g == b'-')
         .filter(|&(_, c)| c != b'-')
         .count()

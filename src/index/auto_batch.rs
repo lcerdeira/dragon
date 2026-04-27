@@ -20,7 +20,7 @@
 /// `search_with_overlays` from Phase 3B) so the end user sees one unified index.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Estimate the number of batches needed based on genome count and available RAM.
 ///
