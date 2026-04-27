@@ -140,35 +140,55 @@ fn align_with_seeds(
         return None;
     }
 
-    // Map seeds to genome coordinates via the path index.
-    let mut ref_positions: Vec<u64> = Vec::new();
-    let mut query_positions: Vec<usize> = Vec::new();
+    // Map seeds to genome coordinates via the path index. Collect
+    // (ref_pos, query_pos, match_len) triples so we can cluster.
+    let mut anchors: Vec<(u64, usize, usize)> = Vec::new();
     for seed in seeds {
         if let Some(step) = genome_path
             .steps
             .iter()
             .find(|s| s.unitig_id == seed.unitig_id)
         {
-            ref_positions.push(step.genome_offset + seed.offset as u64);
-            query_positions.push(seed.query_pos);
+            anchors.push((
+                step.genome_offset + seed.offset as u64,
+                seed.query_pos,
+                seed.match_len,
+            ));
         }
     }
-    if ref_positions.is_empty() {
+    if anchors.is_empty() {
         return None;
     }
 
-    let ref_min = *ref_positions.iter().min().unwrap();
-    let ref_max = ref_positions
+    // Cluster anchors around the median ref_position to avoid one rogue seed
+    // (that mapped to a duplicated region elsewhere in the genome) blowing
+    // the alignment window up to megabases. WFA on 59 bp × 2.8 Mb allocates
+    // O(s · n) cells = many GB and OOMs the process.
+    //
+    // Keep only anchors within MAX_CLUSTER_SPAN bp of the median; if that
+    // cluster is too tight or empty, fall back to a window centred on the
+    // median. Bounds the extracted reference to (3 · query.len() + 2 · pad).
+    let max_cluster_span: u64 = (query.len() as u64 * 3).max(500);
+    anchors.sort_by_key(|a| a.0);
+    let median_pos = anchors[anchors.len() / 2].0;
+    let half_span = max_cluster_span / 2;
+    let cluster_lo = median_pos.saturating_sub(half_span);
+    let cluster_hi = median_pos.saturating_add(half_span);
+    anchors.retain(|(p, _, _)| *p >= cluster_lo && *p <= cluster_hi);
+    if anchors.is_empty() {
+        return None;
+    }
+
+    let ref_min = anchors.iter().map(|a| a.0).min().unwrap();
+    let ref_max = anchors
         .iter()
-        .zip(seeds.iter())
-        .map(|(&pos, seed)| pos + seed.match_len as u64)
+        .map(|(p, _, ml)| *p + *ml as u64)
         .max()
         .unwrap_or(ref_min);
-    let query_min = *query_positions.iter().min().unwrap();
-    let query_max = query_positions
+    let query_min = anchors.iter().map(|a| a.1).min().unwrap();
+    let query_max = anchors
         .iter()
-        .zip(seeds.iter())
-        .map(|(&pos, seed)| pos + seed.match_len)
+        .map(|(_, q, ml)| *q + *ml)
         .max()
         .unwrap_or(query_min);
 
@@ -176,7 +196,9 @@ fn align_with_seeds(
         return None;
     }
 
-    // Pad the reference window so WFA has slack for end gaps.
+    // Pad the reference window. After clustering, this is bounded by
+    // max_cluster_span + 2 · ALIGN_PAD ≈ a few hundred bp for short queries,
+    // a few kb for longer ones — never megabases.
     let extract_start = ref_min.saturating_sub(ALIGN_PAD as u64);
     let extract_end = (ref_max + ALIGN_PAD as u64).min(genome_path.genome_length);
     let ref_seq = PathIndex::extract_sequence_static(
