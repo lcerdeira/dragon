@@ -205,11 +205,12 @@ pub fn build_path_index(
     let num_genomes = genome_files.len();
 
     let path_file = output_dir.join("paths.bin");
-    let file = std::fs::File::create(&path_file)?;
-    let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, file);
-
-    // Length prefix (matches bincode's fixint Vec encoding).
-    bincode::serialize_into(&mut writer, &(num_genomes as u64))?;
+    // v2 mmap-friendly format. Per-genome blobs are streamed; only the offset
+    // table accumulates in RAM (8 bytes × num_genomes ≈ 256 KB for 32K).
+    let mut writer = crate::index::paths_v2::PathV2Writer::create(
+        &path_file,
+        num_genomes as u64,
+    )?;
 
     let mut total_steps = 0usize;
     let mut total_mapped_bases = 0u64;
@@ -285,7 +286,7 @@ pub fn build_path_index(
             genome_length: genome_offset,
             steps,
         };
-        bincode::serialize_into(&mut writer, &path)?;
+        writer.write_genome(&path)?;
         // `path` drops here — per-genome memory is not retained.
 
         if (genome_id + 1) % log_every == 0 || genome_id + 1 == num_genomes {
@@ -296,9 +297,7 @@ pub fn build_path_index(
         }
     }
 
-    use std::io::Write as _;
-    writer.flush()?;
-    drop(writer);
+    writer.finish()?;
 
     log::info!(
         "Path index: {} genomes, {} total steps, {:.1}% bases mapped",
@@ -314,10 +313,40 @@ pub fn build_path_index(
     Ok(())
 }
 
-/// Load the path index from disk.
+/// Load the path index from disk. Backwards-compatible: dispatches on the
+/// file magic so old (bincode) and new (paths_v2 mmap) formats both work.
+///
+/// For new code that wants O(1) load time and per-genome lazy decoding, use
+/// [`open_path_index_mmap`] instead — this function eagerly materializes
+/// every genome into RAM for compatibility with legacy callers.
 pub fn load_path_index(index_dir: &Path) -> Result<PathIndex> {
     let path_file = index_dir.join("paths.bin");
-    crate::util::mmap::read_bincode(&path_file)
+    if crate::index::paths_v2::is_v2(&path_file)? {
+        // Eagerly decode all genomes — preserves the legacy in-memory shape.
+        // Hot-path consumers should switch to open_path_index_mmap().
+        let mmap_idx = crate::index::paths_v2::MmapPathIndex::open(&path_file)?;
+        let n = mmap_idx.num_genomes();
+        let mut paths = Vec::with_capacity(n as usize);
+        for gid in 0..n {
+            let p = mmap_idx
+                .get_path(gid as u32)?
+                .ok_or_else(|| anyhow::anyhow!("missing genome {gid}"))?;
+            paths.push(p);
+        }
+        Ok(PathIndex { paths })
+    } else {
+        // Legacy bincode `Vec<GenomePath>` format.
+        crate::util::mmap::read_bincode(&path_file)
+    }
+}
+
+/// O(1)-load mmap view of `paths.bin`. Only available for v2 files; old
+/// bincode files still need [`load_path_index`].
+pub fn open_path_index_mmap(
+    index_dir: &Path,
+) -> Result<crate::index::paths_v2::MmapPathIndex> {
+    let path_file = index_dir.join("paths.bin");
+    crate::index::paths_v2::MmapPathIndex::open(&path_file)
 }
 
 #[cfg(test)]

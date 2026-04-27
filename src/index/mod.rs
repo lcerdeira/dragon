@@ -5,6 +5,7 @@ pub mod fm;
 pub mod ggcat_colors;
 pub mod metadata;
 pub mod paths;
+pub mod paths_v2;
 pub mod specificity;
 pub mod unitig;
 pub mod update;
