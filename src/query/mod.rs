@@ -121,6 +121,26 @@ pub fn search(
     let queries = crate::io::fasta::read_sequences(query_file)?;
     log::info!("Loaded {} queries", queries.len());
 
+    /// Read VmRSS in MB from /proc/self/status. Linux-only; returns None elsewhere.
+    fn rss_mb() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+                return Some(kb / 1024);
+            }
+        }
+        None
+    }
+    macro_rules! log_rss {
+        ($stage:expr) => {
+            if let Some(mb) = rss_mb() {
+                log::info!("[mem] {} RSS={} MB", $stage, mb);
+            }
+        };
+    }
+    log_rss!("after-load");
+
     let mut results = Vec::new();
 
     for query in &queries {
@@ -134,6 +154,7 @@ pub fn search(
             config.min_chain_score
         };
 
+        log_rss!("before-find_seeds");
         // Stage 1: Find seeds via FM-index backward search
         let seeds = seed::find_seeds(
             &query.seq,
@@ -141,6 +162,8 @@ pub fn search(
             config.min_seed_len,
             config.max_seed_freq,
         );
+        log::info!("[stage] find_seeds: {} seeds", seeds.len());
+        log_rss!("after-find_seeds");
 
         // Stage 2: Identify candidate genomes via color voting
         // Adaptive threshold: use at most 20% of seed count, but at least 2
@@ -150,6 +173,8 @@ pub fn search(
             base_min_votes.min((seeds.len() as u32 / 5).max(2))
         };
         let candidates = candidate::find_candidates(&seeds, &color_index, min_votes);
+        log::info!("[stage] find_candidates: {} candidates", candidates.len());
+        log_rss!("after-find_candidates");
 
         // Dump seeds with full ML features if requested (for training data generation)
         if let Some(ref mut writer) = seed_dump {
@@ -194,6 +219,7 @@ pub fn search(
         // Computes k-mer containment between query and each genome via color index.
         // This bypasses the unitig-boundary seeding problem by counting ALL k-mer
         // matches, not just those within single unitigs.
+        log_rss!("before-containment_rank");
         let containment_hits = containment::containment_rank(
             &query.seq,
             &fm_index,
@@ -201,10 +227,13 @@ pub fn search(
             config.min_seed_len.min(31), // Use k for containment counting
             config.max_seed_freq,
         );
+        log::info!("[stage] containment_rank: {} hits", containment_hits.len());
+        log_rss!("after-containment_rank");
 
         // Stage 4: Direct alignment against top candidates
         // Extracts actual genome sequences and aligns directly, bypassing
         // the lossy unitig→path→coordinate mapping.
+        log_rss!("before-direct_align");
         let mut alignments = direct_align::direct_align_candidates(
             &query.seq,
             &query.name,
@@ -213,6 +242,8 @@ pub fn search(
             &unitigs,
             config.max_target_seqs,
         );
+        log::info!("[stage] direct_align: {} alignments", alignments.len());
+        log_rss!("after-direct_align");
 
         // Stage 5: Post-alignment filtering — this is critical for precision
         alignments.retain(|record| {
