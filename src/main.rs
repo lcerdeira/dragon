@@ -1294,9 +1294,16 @@ echo "  Download complete."
             log::info!("Dest:   {:?}", output);
             let stats = dragon::index::zarr_backend::export_to_zarr(&index, &output)?;
             log::info!(
-                "Export complete: {} unitigs, {} genomes, {} text bytes, {} SA entries, {} bitmap bytes",
-                stats.num_unitigs, stats.num_genomes, stats.text_len, stats.sa_len, stats.colors_bytes
+                "Export complete: {} unitigs, {} genomes, {} text bytes, {} SA entries, {} bitmap bytes, {} path bytes",
+                stats.num_unitigs, stats.num_genomes, stats.text_len, stats.sa_len, stats.colors_bytes, stats.paths_bytes
             );
+            if stats.paths_bytes == 0 {
+                log::warn!(
+                    "/paths was NOT exported. To enable full WFA alignment via 'dragon search-zarr', \
+                     run 'dragon migrate-paths -i {:?}' first, then re-run export-zarr.",
+                    index
+                );
+            }
         }
 
         Commands::SearchZarr { zarr, query, output } => {

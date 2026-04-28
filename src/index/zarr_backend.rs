@@ -46,6 +46,11 @@ pub const SA_CHUNK_SIZE: u64 = 131_072;
 /// 1 MiB per bitmap-blob chunk.
 pub const BITMAP_CHUNK_SIZE: u64 = 1_048_576;
 
+/// 4 MiB per paths-blob chunk. paths.bin v2 can be 100s of GB on disk;
+/// larger chunks reduce per-chunk overhead at the cost of slightly bigger
+/// minimum reads for cloud queries.
+pub const PATHS_BLOB_CHUNK_SIZE: u64 = 4 * 1_048_576;
+
 /// Zstd compression level for all compressed arrays.
 pub const ZSTD_LEVEL: i32 = 3;
 
@@ -106,12 +111,25 @@ pub fn export_to_zarr(index_dir: &Path, zarr_path: &Path) -> Result<ExportStats>
     // /colors/{offsets,bitmaps}: per-unitig bitmap offsets + flat blob.
     let colors_bytes = write_colors(&colors, store.clone())?;
 
+    // /paths/{offsets,blobs}: per-genome path blobs from paths.bin v2.
+    // Skipped silently if paths.bin is absent or in legacy bincode format
+    // (export still produces a valid pattern-search index, but the cloud
+    // store cannot be used for full WFA alignment until paths.bin v2 exists).
+    let paths_bytes = write_paths(index_dir, store.clone()).unwrap_or_else(|e| {
+        log::warn!(
+            "/paths not exported (search-zarr full alignment unavailable): {e}. \
+             Run 'dragon migrate-paths -i <index>' first to enable."
+        );
+        0
+    });
+
     Ok(ExportStats {
         num_unitigs,
         num_genomes,
         text_len,
         sa_len,
         colors_bytes,
+        paths_bytes,
     })
 }
 
@@ -123,6 +141,9 @@ pub struct ExportStats {
     pub text_len: u64,
     pub sa_len: u64,
     pub colors_bytes: u64,
+    /// Bytes written to /paths/blobs (raw, before Zstd). Zero if paths.bin
+    /// was absent or in legacy bincode format.
+    pub paths_bytes: u64,
 }
 
 fn write_text_array(text: &[u8], store: ReadableWritableListableStorage) -> Result<()> {
@@ -233,6 +254,117 @@ fn write_colors(
     bm_array.store_array_subset(&bm_array.subset_all(), blob.as_slice())?;
 
     Ok(total)
+}
+
+/// Export `paths.bin` (must be in v2 format) as `/paths/offsets` and
+/// `/paths/blobs` Zarr arrays. The on-disk v2 layout is
+/// header + offsets-table + concatenated-blobs; we copy the offsets
+/// table verbatim (rebased so that offsets[0] == 0) and stream the
+/// blob region into a Zstd-compressed chunked array. Memory bounded by
+/// PATHS_BLOB_CHUNK_SIZE (4 MiB), regardless of total file size.
+fn write_paths(
+    index_dir: &Path,
+    store: ReadableWritableListableStorage,
+) -> Result<u64> {
+    let path_file = index_dir.join("paths.bin");
+    if !path_file.exists() {
+        anyhow::bail!("paths.bin not found in {:?}", index_dir);
+    }
+    if !crate::index::paths_v2::is_v2(&path_file)? {
+        anyhow::bail!(
+            "paths.bin in {:?} is in legacy bincode format; \
+             run 'dragon migrate-paths -i <index>' first",
+            index_dir
+        );
+    }
+
+    let file = std::fs::File::open(&path_file)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+    // Header: magic(8) + version(4) + num_genomes(8) + reserved(8) = 28 bytes
+    const HEADER_SIZE: usize = 28;
+    let num_genomes = u64::from_le_bytes(mmap[12..20].try_into().unwrap());
+    let table_size = (num_genomes as usize + 1) * 8;
+    let table_end = HEADER_SIZE + table_size;
+    if mmap.len() < table_end {
+        anyhow::bail!("paths.bin truncated within offset table");
+    }
+
+    // Read absolute offsets, rebase to relative for the Zarr blob array.
+    let abs_offsets: Vec<u64> = (0..=num_genomes as usize)
+        .map(|i| {
+            let p = HEADER_SIZE + i * 8;
+            u64::from_le_bytes(mmap[p..p + 8].try_into().unwrap())
+        })
+        .collect();
+    let blob_start = abs_offsets[0] as usize;
+    let blob_end = abs_offsets[num_genomes as usize] as usize;
+    if blob_end > mmap.len() || blob_start > blob_end {
+        anyhow::bail!("paths.bin offset table points beyond file end");
+    }
+    let blob_len = blob_end - blob_start;
+    let rel_offsets: Vec<u64> = abs_offsets
+        .iter()
+        .map(|&o| o - abs_offsets[0])
+        .collect();
+
+    log::info!(
+        "Writing /paths ({} genomes, blob {} bytes, chunk={} B, zstd-{})",
+        num_genomes, blob_len, PATHS_BLOB_CHUNK_SIZE, ZSTD_LEVEL
+    );
+
+    // /paths group
+    let group = GroupBuilder::new().build(store.clone(), "/paths")?;
+    group.store_metadata()?;
+
+    // /paths/offsets (n+1 entries, single chunk).
+    let off_array = ArrayBuilder::new(
+        vec![rel_offsets.len() as u64],
+        vec![rel_offsets.len().max(1) as u64],
+        data_type::uint64(),
+        0u64,
+    )
+    .dimension_names(["genome_id"].into())
+    .build(store.clone(), "/paths/offsets")?;
+    off_array.store_metadata()?;
+    off_array.store_array_subset(&off_array.subset_all(), rel_offsets.as_slice())?;
+
+    // /paths/blobs (huge — chunked, Zstd-compressed).
+    let blob_array = ArrayBuilder::new(
+        vec![blob_len as u64],
+        vec![PATHS_BLOB_CHUNK_SIZE],
+        data_type::uint8(),
+        0u8,
+    )
+    .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(ZSTD_LEVEL, false))])
+    .dimension_names(["byte"].into())
+    .build(store, "/paths/blobs")?;
+    blob_array.store_metadata()?;
+
+    // Stream the blob in 4 MiB-aligned windows. store_array_subset chunks
+    // internally per zarr chunk shape, so memory peak ≈ one chunk
+    // regardless of total blob size. Doing it in chunks (rather than one
+    // big call) lets us emit progress and lets the OS reclaim mmap pages
+    // we've finished with.
+    let stride = PATHS_BLOB_CHUNK_SIZE as usize;
+    let num_strides = (blob_len + stride - 1) / stride;
+    for i in 0..num_strides {
+        let s = i * stride;
+        let e = (s + stride).min(blob_len);
+        let subset = ArraySubset::new_with_ranges(&[s as u64..e as u64]);
+        let slice = &mmap[blob_start + s..blob_start + e];
+        blob_array.store_array_subset(&subset, slice)?;
+        if (i + 1) % 256 == 0 || i + 1 == num_strides {
+            log::info!(
+                "  /paths/blobs: wrote {}/{} {}-MiB strides ({:.1}%)",
+                i + 1, num_strides,
+                stride / (1024 * 1024),
+                100.0 * (i + 1) as f64 / num_strides as f64
+            );
+        }
+    }
+
+    Ok(blob_len as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +547,117 @@ impl ZarrColorIndex {
     pub fn num_genomes(&self) -> u64 { self.num_genomes }
 }
 
+/// Path index variant backed by a Zarr store. Lazy: each `get_path` reads
+/// two `/paths/offsets` entries + the implied byte range from
+/// `/paths/blobs`, then varint-decodes the genome's path on the fly.
+/// Memory bounded by the largest single genome's step list.
+pub struct ZarrPathIndex {
+    offsets: Array<FilesystemStore>,
+    blobs: Array<FilesystemStore>,
+    pub num_genomes: u64,
+}
+
+impl ZarrPathIndex {
+    pub fn open(zarr_path: &Path) -> Result<Self> {
+        let store = Arc::new(FilesystemStore::new(zarr_path)?);
+        let offsets = Array::open(store.clone(), "/paths/offsets")
+            .context("open /paths/offsets — store has no path index? \
+                      run 'dragon migrate-paths' then re-export to Zarr")?;
+        let blobs = Array::open(store.clone(), "/paths/blobs")
+            .context("open /paths/blobs")?;
+
+        let root = zarrs::group::Group::open(store, "/")?;
+        let num_genomes = root
+            .attributes()
+            .get("num_genomes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(offsets.shape()[0].saturating_sub(1));
+
+        Ok(Self { offsets, blobs, num_genomes })
+    }
+
+    /// Decode the path for `genome_id`. Returns `None` if out of range.
+    pub fn get_path(
+        &self,
+        genome_id: u32,
+    ) -> Result<Option<crate::index::paths::GenomePath>> {
+        let gid = u64::from(genome_id);
+        if gid >= self.num_genomes {
+            return Ok(None);
+        }
+        let off_subset = ArraySubset::new_with_ranges(&[gid..gid + 2]);
+        let offs: Vec<u64> = self.offsets.retrieve_array_subset(&off_subset)?;
+        let (start, end) = (offs[0], offs[1]);
+        if end <= start {
+            return Ok(None);
+        }
+        let blob_subset = ArraySubset::new_with_ranges(&[start..end]);
+        let blob: Vec<u8> = self.blobs.retrieve_array_subset(&blob_subset)?;
+
+        // Decode the same varint format as paths_v2::MmapPathIndex::get_path:
+        //   varint name_length, bytes name, varint genome_length,
+        //   varint num_steps, then steps as (varint mixed, varint delta).
+        let mut p = 0usize;
+        let (name_len, np) = read_varint(&blob, p)?;
+        p = np;
+        let name = std::str::from_utf8(&blob[p..p + name_len as usize])
+            .context("zarr path: name not UTF-8")?
+            .to_owned();
+        p += name_len as usize;
+        let (genome_length, np) = read_varint(&blob, p)?;
+        p = np;
+        let (num_steps, np) = read_varint(&blob, p)?;
+        p = np;
+        let mut steps = Vec::with_capacity(num_steps as usize);
+        let mut prev = 0u64;
+        for _ in 0..num_steps {
+            let (mixed, np) = read_varint(&blob, p)?;
+            p = np;
+            let (delta, np) = read_varint(&blob, p)?;
+            p = np;
+            prev = prev.checked_add(delta)
+                .ok_or_else(|| anyhow::anyhow!("zarr path: offset overflow"))?;
+            steps.push(crate::index::paths::PathStep {
+                unitig_id: (mixed >> 1) as u32,
+                is_reverse: (mixed & 1) == 1,
+                genome_offset: prev,
+            });
+        }
+
+        Ok(Some(crate::index::paths::GenomePath {
+            genome_id,
+            genome_name: name,
+            genome_length,
+            steps,
+        }))
+    }
+
+    pub fn num_genomes(&self) -> u64 { self.num_genomes }
+}
+
+/// LEB128 varint decode shared with paths_v2 (kept inline here to avoid a
+/// circular pub-mod dependency on a private helper).
+fn read_varint(bytes: &[u8], pos: usize) -> Result<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut p = pos;
+    loop {
+        if p >= bytes.len() {
+            anyhow::bail!("varint truncated at offset {p}");
+        }
+        let byte = bytes[p];
+        p += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((value, p));
+        }
+        shift += 7;
+        if shift >= 64 {
+            anyhow::bail!("varint exceeds u64 range");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,12 +686,22 @@ mod tests {
         std::fs::write(&color_tsv, "0\t0\n1\t0\n")?;
         crate::index::color::build_color_index(&color_tsv, &idx_dir, 1)?;
 
+        // Build a v2 paths.bin from a tiny synthetic genome dir so the
+        // exporter has /paths to write.
+        let g_dir = tmp.path().join("genomes");
+        std::fs::create_dir_all(&g_dir)?;
+        std::fs::write(g_dir.join("g.fa"), b">g\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n")?;
+        crate::index::paths::build_path_index(&g_dir, &unitigs, &idx_dir, 31)?;
+
         let zarr_dir = tmp.path().join("out.zarr");
         let stats = export_to_zarr(&idx_dir, &zarr_dir)?;
 
         assert_eq!(stats.num_unitigs, 2);
         assert_eq!(stats.num_genomes, 1);
         assert!(stats.text_len >= 16);
+        // /paths should now have been exported (paths.bin is v2 since
+        // build_path_index writes v2 by default).
+        assert!(stats.paths_bytes > 0, "paths_bytes should be non-zero");
 
         // Round-trip read: reopen the store and verify /text bytes match.
         let store: ReadableWritableListableStorage =

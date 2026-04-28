@@ -507,8 +507,8 @@ fn test_paf_output_format() {
     assert_eq!(fields[11], "60"); // mapq
     assert_eq!(fields[12], "AS:i:1900");
 
-    // Identity
-    assert!((record.identity() - 0.9694).abs() < 0.001);
+    // BLAST-style query identity: matches / query_len = 950 / 1000 = 0.95
+    assert!((record.identity() - 0.95).abs() < 0.001);
 }
 
 #[test]
