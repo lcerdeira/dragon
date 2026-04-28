@@ -197,21 +197,39 @@ impl PathIndex {
                 continue;
             }
 
+            // Genome-relative window [local_start, local_end] within this
+            // step. For a forward step, this maps directly to unitig
+            // coordinates: U[local_start..local_end].
+            //
+            // For a reverse step, the genome is reading RC(U), and we want
+            // RC(U)[local_start..local_end]. To produce this from the
+            // forward unitig text we must extract the MIRROR window
+            // U[L - local_end .. L - local_start] and then reverse-
+            // complement it. Without this remap, we'd return the wrong
+            // (mirrored) portion of the unitig — silent corruption that
+            // showed up as a 0.73 identity ceiling on 16K-genome ermC
+            // searches.
             let local_start = (overlap_start - step.genome_offset) as usize;
             let local_end = (overlap_end - step.genome_offset) as usize;
 
-            let mut subseq = unitigs.get_subsequence(step.unitig_id, local_start, local_end);
-
-            if step.is_reverse {
-                subseq.reverse();
-                for base in &mut subseq {
+            let mut subseq = if step.is_reverse {
+                let l = unitig_len as usize;
+                let u_start = l.saturating_sub(local_end);
+                let u_end = l.saturating_sub(local_start);
+                let mut s = unitigs.get_subsequence(step.unitig_id, u_start, u_end);
+                s.reverse();
+                for base in &mut s {
                     *base = match *base {
                         b'A' => b'T', b'T' => b'A',
                         b'C' => b'G', b'G' => b'C',
                         other => other,
                     };
                 }
-            }
+                s
+            } else {
+                unitigs.get_subsequence(step.unitig_id, local_start, local_end)
+            };
+            let _ = &mut subseq; // silence unused-mut for the forward branch
 
             result.extend_from_slice(&subseq);
             emitted_up_to = Some(overlap_end);
