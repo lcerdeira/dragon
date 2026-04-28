@@ -104,8 +104,28 @@ pub fn direct_align_candidates(
             continue;
         }
 
-        let fwd_seeds: Vec<_> = hit.seeds.iter().filter(|s| !s.is_reverse).collect();
-        let rev_seeds: Vec<_> = hit.seeds.iter().filter(|s| s.is_reverse).collect();
+        // Partition seeds by EFFECTIVE strand of the query→genome match,
+        // not by seed.is_reverse alone. The effective strand is the XOR
+        // of seed.is_reverse (was the QUERY RC'd when searching the
+        // FM-index?) and step.is_reverse (is the GENOME reading the
+        // unitig in RC?). Only seeds whose XOR is false anchor a
+        // forward-strand alignment; the others anchor a reverse-strand
+        // alignment and need the query RC'd before WFA.
+        let mut fwd_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
+        let mut rev_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
+        for s in &hit.seeds {
+            let step_rev = genome_path
+                .steps
+                .iter()
+                .find(|st| st.unitig_id == s.unitig_id)
+                .map(|st| st.is_reverse)
+                .unwrap_or(false);
+            if s.is_reverse == step_rev {
+                fwd_seeds.push(s);
+            } else {
+                rev_seeds.push(s);
+            }
+        }
 
         if let Some(record) = align_with_seeds(
             query, query_name, &fwd_seeds, hit, &genome_path, unitigs, candidates, false,
@@ -142,23 +162,19 @@ fn align_with_seeds(
         return None;
     }
 
-    // Map seeds to genome coordinates via the path index. Collect
-    // (ref_pos, query_pos, match_len) triples so we can cluster.
-    //
-    // Seed→genome translation depends on TWO orientations:
-    //   * step.is_reverse — does the genome traverse this unitig in
-    //     forward or RC direction?
-    //   * seed.is_reverse — did the query match the unitig's forward or
-    //     RC text?
-    // When both agree, seed.offset (within the unitig) maps directly to
-    // step.genome_offset + seed.offset. When they disagree, the seed is
-    // offset from the OTHER end of the unitig as traversed by the genome,
-    // so the correct genome position is
-    //   step.genome_offset + (unitig_len - seed.offset - match_len).
-    // Without this correction every genome whose unitig is canonicalised
-    // in the opposite orientation is anchored at the wrong locus, and WFA
-    // sees a shifted reference window — which is what produced the 0.73
-    // ceiling on the ermC reproducer where BLAST/minimap2 see 1.000.
+    // Map seeds to genome coordinates via the path index. The genome
+    // position of the seed match depends ONLY on step.is_reverse:
+    //   * step.is_reverse=false: genome reads the unitig forward, so
+    //     a seed at unitig offset O lands at genome step.genome_offset + O.
+    //   * step.is_reverse=true: genome reads RC(unitig), so a seed at
+    //     unitig offset O lands at genome step.genome_offset +
+    //     unitig_len - (O + match_len).
+    // The query orientation (seed.is_reverse) governs the alignment
+    // strand — but that's already taken care of by the caller, who has
+    // partitioned seeds into fwd_seeds / rev_seeds by EFFECTIVE strand
+    // (seed.is_reverse XOR step.is_reverse). At this point all anchors
+    // we accept share the same effective strand; we just need the
+    // correct genome anchor coordinates.
     let mut anchors: Vec<(u64, usize, usize)> = Vec::new();
     for seed in seeds {
         if let Some(step) = genome_path
@@ -171,11 +187,11 @@ fn align_with_seeds(
                 .get(seed.unitig_id as usize)
                 .map(|u| u.sequence.len as u64)
                 .unwrap_or(0);
-            let pos_in_genome = if seed.is_reverse == step.is_reverse {
-                step.genome_offset + seed.offset as u64
-            } else {
+            let pos_in_genome = if step.is_reverse {
                 let off = seed.offset as u64 + seed.match_len as u64;
                 step.genome_offset + unitig_len.saturating_sub(off)
+            } else {
+                step.genome_offset + seed.offset as u64
             };
             anchors.push((pos_in_genome, seed.query_pos, seed.match_len));
         }
