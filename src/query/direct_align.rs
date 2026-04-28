@@ -144,6 +144,21 @@ fn align_with_seeds(
 
     // Map seeds to genome coordinates via the path index. Collect
     // (ref_pos, query_pos, match_len) triples so we can cluster.
+    //
+    // Seed→genome translation depends on TWO orientations:
+    //   * step.is_reverse — does the genome traverse this unitig in
+    //     forward or RC direction?
+    //   * seed.is_reverse — did the query match the unitig's forward or
+    //     RC text?
+    // When both agree, seed.offset (within the unitig) maps directly to
+    // step.genome_offset + seed.offset. When they disagree, the seed is
+    // offset from the OTHER end of the unitig as traversed by the genome,
+    // so the correct genome position is
+    //   step.genome_offset + (unitig_len - seed.offset - match_len).
+    // Without this correction every genome whose unitig is canonicalised
+    // in the opposite orientation is anchored at the wrong locus, and WFA
+    // sees a shifted reference window — which is what produced the 0.73
+    // ceiling on the ermC reproducer where BLAST/minimap2 see 1.000.
     let mut anchors: Vec<(u64, usize, usize)> = Vec::new();
     for seed in seeds {
         if let Some(step) = genome_path
@@ -151,11 +166,18 @@ fn align_with_seeds(
             .iter()
             .find(|s| s.unitig_id == seed.unitig_id)
         {
-            anchors.push((
-                step.genome_offset + seed.offset as u64,
-                seed.query_pos,
-                seed.match_len,
-            ));
+            let unitig_len = unitigs
+                .unitigs
+                .get(seed.unitig_id as usize)
+                .map(|u| u.sequence.len as u64)
+                .unwrap_or(0);
+            let pos_in_genome = if seed.is_reverse == step.is_reverse {
+                step.genome_offset + seed.offset as u64
+            } else {
+                let off = seed.offset as u64 + seed.match_len as u64;
+                step.genome_offset + unitig_len.saturating_sub(off)
+            };
+            anchors.push((pos_in_genome, seed.query_pos, seed.match_len));
         }
     }
     if anchors.is_empty() {
