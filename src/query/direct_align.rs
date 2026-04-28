@@ -236,14 +236,27 @@ fn align_with_seeds(
         return None;
     }
 
-    // Project the reference window to span the FULL query, not just the
-    // seed-covered portion. Anchors give us a "translation" between query
-    // coordinates and ref coordinates; assuming approximate colinearity,
-    // query position 0 lands at ref position (ref_min - query_min) and
-    // query position query.len() lands at (ref_min - query_min + query.len()).
-    // We then add ALIGN_PAD on each side for end-gap slack.
-    let est_ref_start_for_query = ref_min.saturating_sub(query_min as u64);
-    let est_ref_end_for_query = est_ref_start_for_query + query.len() as u64;
+    // Project the reference window to span the FULL query.
+    //
+    // For FORWARD alignment, anchors map original query[X..X+M] → genome
+    // [pos_in_genome..pos_in_genome+M]. So query[0] → ref_min - query_min,
+    // and the window is [ref_min - query_min .. ref_min - query_min + L].
+    //
+    // For REVERSE alignment we align RC(query) (length L) against genome
+    // forward. An anchor with original query_pos = X and match_len = M
+    // corresponds to RC(query) positions [L-X-M .. L-X]. So RC(query)[0]
+    // lands at pos_in_genome - (L - X - M), and the smallest such value
+    // across seeds is ref_min - (L - max(X + M)) = ref_min - (L - query_max).
+    // Using `query_min` here (the original-query-coord min) shifts the
+    // window left by an arbitrary amount and was the source of the
+    // saureus 0.74 identity ceiling on reverse-strand hits.
+    let l = query.len() as u64;
+    let est_ref_start_for_query = if is_reverse {
+        ref_min.saturating_sub(l.saturating_sub(query_max as u64))
+    } else {
+        ref_min.saturating_sub(query_min as u64)
+    };
+    let est_ref_end_for_query = est_ref_start_for_query + l;
     let extract_start = est_ref_start_for_query.saturating_sub(ALIGN_PAD as u64);
     let extract_end = (est_ref_end_for_query + ALIGN_PAD as u64)
         .min(genome_path.genome_length);
