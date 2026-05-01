@@ -86,7 +86,7 @@ fn build_with_ggcat(
             "-o",
             &unitig_file.to_string_lossy(),
             "-s",
-            1,
+            "1",
         ])
         .status()
         .context("Failed to run GGCAT")?;
