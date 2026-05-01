@@ -353,46 +353,17 @@ fn align_with_seeds(
         Err(_) => return None,
     };
 
-    // Trim alignment to the high-scoring core. WFA runs in global mode
-    // and must consume the full reference window, so the surrounding pad
-    // bases get scattered as D/X ops through the alignment. Without this
-    // trim, identity is artificially capped at ~1 - 2·PAD/(q + 2·PAD).
-    // Drop everything outside the first/last run of CORE_RUN consecutive
-    // exact-match positions. If no such run exists, fall back to the
-    // untrimmed alignment so we don't regress on highly-divergent hits.
-    const CORE_RUN: usize = 3;
-    let q_aln: Vec<u8> = alignment.query_aligned.bytes().collect();
-    let t_aln: Vec<u8> = alignment.text_aligned.bytes().collect();
-    debug_assert_eq!(q_aln.len(), t_aln.len());
-    let n = q_aln.len();
-    let is_match_at = |i: usize| -> bool {
-        q_aln[i] != b'-' && t_aln[i] != b'-' && q_aln[i].eq_ignore_ascii_case(&t_aln[i])
-    };
-    let core_first = if n >= CORE_RUN {
-        (0..=n - CORE_RUN).find(|&i| (i..i + CORE_RUN).all(|j| is_match_at(j)))
-    } else {
-        None
-    };
-    let (trim_start, trim_end) = match core_first {
-        Some(s) => {
-            let e = (CORE_RUN..=n)
-                .rev()
-                .find(|&i| (i - CORE_RUN..i).all(|j| is_match_at(j)))
-                .unwrap_or(n);
-            (s, e)
-        }
-        None => (0, n), // fall back: no clean core, use whole alignment
-    };
-    let pre_trim_target: usize = t_aln[..trim_start].iter().filter(|&&b| b != b'-').count();
-    let pre_trim_query: usize = q_aln[..trim_start].iter().filter(|&&b| b != b'-').count();
-    let stats = AlignmentStats::from_aligned_strings(
-        &q_aln[trim_start..trim_end],
-        &t_aln[trim_start..trim_end],
-    );
+    // Translate the WFA aligned strings into CIGAR + counts.
+    let stats = AlignmentStats::from_wfa(&alignment);
+
+    // Compute genome-coordinate target span from the leading/trailing
+    // text-side gaps so target_start/target_end describe only the aligned
+    // portion (not the padded extraction window).
+    let text_lead_in_ref = leading_gap_consumed(&alignment.query_aligned, &alignment.text_aligned);
 
     // text-side leading skip = bases of t consumed before the alignment proper begins
     let aligned_target_len = stats.target_consumed;
-    let target_start_in_window = pre_trim_target;
+    let target_start_in_window = text_lead_in_ref;
     let target_end_in_window = target_start_in_window + aligned_target_len;
 
     let extract_window_start = if q_len > t.len() {
@@ -409,6 +380,7 @@ fn align_with_seeds(
     // full query (query_min_in_align == 0 after the slicing change above),
     // so coordinate mapping just needs to undo the reverse-complement when
     // applicable.
+    let q_lead_gap = leading_gap_consumed(&alignment.text_aligned, &alignment.query_aligned);
     let q_aligned_len = stats.query_consumed;
     let _ = query_min_in_align; // placeholder; full query is always 0..query.len()
     let (final_q_start, final_q_end) = if is_reverse {
@@ -416,13 +388,13 @@ fn align_with_seeds(
         // Map back: a RC slice's [a, b) corresponds to original [L-b, L-a)
         // where L = q_str.len().
         let l = q_str.len();
-        let a = pre_trim_query;
+        let a = q_lead_gap;
         let b = a + q_aligned_len;
         let rc_start = l - b;
         let rc_end = l - a;
         (rc_start, rc_end)
     } else {
-        (pre_trim_query, pre_trim_query + q_aligned_len)
+        (q_lead_gap, q_lead_gap + q_aligned_len)
     };
 
     let alignment_len = stats.alignment_len;
@@ -478,14 +450,16 @@ impl AlignmentStats {
     fn from_wfa(a: &Alignment) -> Self {
         let q: Vec<u8> = a.query_aligned.bytes().collect();
         let t: Vec<u8> = a.text_aligned.bytes().collect();
-        Self::from_aligned_strings(&q, &t)
-    }
+        debug_assert_eq!(q.len(), t.len(), "WFA aligned strings must be equal length");
 
-    /// Build stats + CIGAR from already-extracted gapped alignment strings.
-    /// Caller passes equal-length byte slices where '-' marks gaps.
-    fn from_aligned_strings(q: &[u8], t: &[u8]) -> Self {
-        debug_assert_eq!(q.len(), t.len(), "aligned strings must be equal length");
+        // Trim leading and trailing positions where BOTH strings are gaps —
+        // shouldn't happen with WFA but be defensive.
+        // We separately handle leading/trailing single-sided gaps as soft
+        // clips at the alignment endpoints.
 
+        // Find first/last index where at least one side is a non-gap base —
+        // this is the body of the alignment. Any single-sided gap region at
+        // the ends is treated as part of the alignment (insertion/deletion).
         let n = q.len();
         let mut s = Self::default();
         if n == 0 {
@@ -546,6 +520,17 @@ impl AlignmentStats {
         s.edits = s.mismatches + s.insertions + s.deletions;
         s
     }
+}
+
+/// Number of bases consumed from `consumed` while `gapped` is leading-gap.
+/// E.g. consumed = "ACGT...", gapped = "----..." → returns 4.
+fn leading_gap_consumed(gapped: &str, consumed: &str) -> usize {
+    gapped
+        .bytes()
+        .zip(consumed.bytes())
+        .take_while(|&(g, _)| g == b'-')
+        .filter(|&(_, c)| c != b'-')
+        .count()
 }
 
 fn reverse_complement(s: &[u8]) -> Vec<u8> {
