@@ -71,6 +71,39 @@ fn make_genome_fasta(name: &str, total_len: usize, gene: &[u8], pos: usize) -> V
     out
 }
 
+/// Build a two-contig FASTA. Each contig has its own random backbone
+/// (different LCG seeds → no shared k-mers across contigs). `gene` is
+/// planted at offset `pos_in_c2` inside contig 2.
+fn make_two_contig_fasta(
+    genome_name: &str,
+    c1_len: usize,
+    c2_len: usize,
+    gene: &[u8],
+    pos_in_c2: usize,
+) -> Vec<u8> {
+    assert!(pos_in_c2 + gene.len() <= c2_len, "gene doesn't fit in c2");
+    let c1 = random_dna(c1_len, 0xC0117_0001);
+    let mut c2 = random_dna(c2_len, 0xC0117_0002);
+    c2[pos_in_c2..pos_in_c2 + gene.len()].copy_from_slice(gene);
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b">");
+    out.extend_from_slice(genome_name.as_bytes());
+    out.extend_from_slice(b".contig1\n");
+    for chunk in c1.chunks(80) {
+        out.extend_from_slice(chunk);
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b">");
+    out.extend_from_slice(genome_name.as_bytes());
+    out.extend_from_slice(b".contig2\n");
+    for chunk in c2.chunks(80) {
+        out.extend_from_slice(chunk);
+        out.push(b'\n');
+    }
+    out
+}
+
 /// Build an index in a tempdir for the given FASTA bytes and return the
 /// (tempdir, index_dir, query_path) triple. The caller is responsible for
 /// holding onto the tempdir so it isn't dropped while the index is in use.
@@ -227,6 +260,159 @@ fn reverse_strand_perfect_match() {
         2200 + gene.len()
     );
     assert_eq!(best.num_matches, gene.len(), "every base should match");
+    assert!(
+        best.identity() >= 0.99,
+        "expected ≈1.0 identity, got {:.3}",
+        best.identity()
+    );
+}
+
+/// Multi-contig genome: two contigs, gene planted in contig 2. This is the
+/// case that fails on real saureus assemblies (50–300 contigs/genome) — the
+/// path-builder's `prev_unitig` state leaks across contig boundaries and the
+/// unitig entry-offset is discarded, so `extract_sequence_static` returns
+/// shifted bases for any step that begins mid-unitig (which happens at every
+/// contig start). Net effect on production benchmarks: ~9× under-selection
+/// of fragmented genomes and a 0.6 identity ceiling on those that do surface.
+#[test]
+fn multi_contig_gene_in_second_contig() {
+    let gene = random_dna(120, 0xBEEF_5A11);
+    let genome = make_two_contig_fasta("g_mc", 4000, 4000, &gene, 1500);
+    let (_tmp, idx, qp) = build_synthetic_index(&genome, "gene", &gene);
+
+    let results = run_search(&idx, &qp);
+    let r = &results[0];
+
+    println!(
+        "{} hits for '{}'. PAF records:",
+        r.alignments.len(),
+        r.query_name
+    );
+    for a in &r.alignments {
+        println!(
+            "  q={}..{}  strand={}  t={}..{}  matches={}  alen={}  id={:.3}",
+            a.query_start,
+            a.query_end,
+            a.strand,
+            a.target_start,
+            a.target_end,
+            a.num_matches,
+            a.alignment_len,
+            a.identity()
+        );
+    }
+    assert!(!r.alignments.is_empty(), "expected at least 1 alignment");
+
+    // Gene is at contig2 pos 1500. Genome coordinates: contig1 (0..4000) +
+    // contig2 (4000..8000). Planted gene starts at genome offset 4000 + 1500
+    // = 5500. Allow a small slop window in case path-walking off-by-ones the
+    // contig boundary.
+    let expected_start: usize = 4000 + 1500;
+    let best = r.alignments.iter().find(|a| {
+        a.strand == '+'
+            && a.target_start >= expected_start.saturating_sub(40)
+            && a.target_start <= expected_start + 40
+    });
+    let best = best.expect(&format!(
+        "no forward alignment near planted position {} — path-builder is dropping or shifting the contig-2 entry step",
+        expected_start
+    ));
+
+    assert_eq!(
+        best.num_matches,
+        gene.len(),
+        "every base should match (got {} of {} for matches; suggests reference window contains shifted/wrong bases)",
+        best.num_matches,
+        gene.len()
+    );
+    assert!(
+        best.identity() >= 0.99,
+        "expected ≈1.0 identity across contig boundary, got {:.3}",
+        best.identity()
+    );
+}
+
+/// Stronger multi-contig test: the gene appears at the END of contig 1 AND
+/// the START of contig 2. Both copies share the same unitig in the dBG, so
+/// at the boundary `prev_unitig` is `(gene_unitig, fwd)` from contig 1, and
+/// contig 2's first k-mer maps to the same unitig — the path-builder will
+/// not emit a new step, and contig 2's copy of the gene becomes invisible
+/// to seed→genome translation. If this test fails, we have a clean repro
+/// for the "SAMEA missing" symptom we see on real saureus shards.
+#[test]
+fn multi_contig_shared_motif_at_boundary() {
+    let gene = random_dna(120, 0xFEED_FACE);
+    // Plant gene at the END of contig 1 and START of contig 2 so the
+    // unitig holding it is shared at the contig boundary.
+    let c1_len = 4000;
+    let c2_len = 4000;
+    let mut c1 = random_dna(c1_len, 0xCAFE_C001);
+    let mut c2 = random_dna(c2_len, 0xCAFE_C002);
+    c1[c1_len - gene.len()..].copy_from_slice(&gene);
+    c2[..gene.len()].copy_from_slice(&gene);
+
+    let mut fasta: Vec<u8> = Vec::new();
+    fasta.extend_from_slice(b">g_shared.contig1\n");
+    for chunk in c1.chunks(80) {
+        fasta.extend_from_slice(chunk);
+        fasta.push(b'\n');
+    }
+    fasta.extend_from_slice(b">g_shared.contig2\n");
+    for chunk in c2.chunks(80) {
+        fasta.extend_from_slice(chunk);
+        fasta.push(b'\n');
+    }
+
+    let (_tmp, idx, qp) = build_synthetic_index(&fasta, "gene", &gene);
+    let results = run_search(&idx, &qp);
+    let r = &results[0];
+
+    println!(
+        "{} hits for '{}'. PAF records:",
+        r.alignments.len(),
+        r.query_name
+    );
+    for a in &r.alignments {
+        println!(
+            "  q={}..{}  strand={}  t={}..{}  matches={}  alen={}  id={:.3}",
+            a.query_start,
+            a.query_end,
+            a.strand,
+            a.target_start,
+            a.target_end,
+            a.num_matches,
+            a.alignment_len,
+            a.identity()
+        );
+    }
+    assert!(!r.alignments.is_empty(), "expected at least 1 alignment");
+
+    // The best hit's target_start should resolve to one of the two planted
+    // positions: contig1 end (genome offset c1_len - gene.len() = 3880) or
+    // contig2 start (genome offset c1_len + 0 = 4000).
+    let pos_c1: usize = c1_len - gene.len();
+    let pos_c2: usize = c1_len;
+    let near = |a: &dragon::io::paf::PafRecord, p: usize| -> bool {
+        a.strand == '+'
+            && (a.target_start as i64 - p as i64).abs() <= 40
+    };
+    let any_correct = r.alignments.iter().any(|a| near(a, pos_c1) || near(a, pos_c2));
+    assert!(
+        any_correct,
+        "no alignment near either planted position (c1 end = {} or c2 start = {})",
+        pos_c1, pos_c2
+    );
+
+    // And the best alignment, wherever it lands, should be id == 1.0 because
+    // the planted gene is verbatim in the genome.
+    let best = &r.alignments[0];
+    assert_eq!(
+        best.num_matches,
+        gene.len(),
+        "every base should match (got {} of {})",
+        best.num_matches,
+        gene.len()
+    );
     assert!(
         best.identity() >= 0.99,
         "expected ≈1.0 identity, got {:.3}",
