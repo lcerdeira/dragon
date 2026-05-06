@@ -220,11 +220,17 @@ pub fn search(
         // This bypasses the unitig-boundary seeding problem by counting ALL k-mer
         // matches, not just those within single unitigs.
         log_rss!("before-containment_rank");
+        // Use the INDEX'S actual k-mer size for containment (the FM-index is
+        // built at this k). Previously this was `config.min_seed_len.min(31)`,
+        // which evaluated to 15 by default — a 15-mer search in a 31-mer
+        // FM-index is highly ambiguous, blows past max_seed_freq for most
+        // query positions, and scatters credit across many unrelated genomes,
+        // losing the per-genome resolution that ranks the right shard hits.
         let containment_hits = containment::containment_rank(
             &query.seq,
             &fm_index,
             &color_index,
-            config.min_seed_len.min(31), // Use k for containment counting
+            metadata.kmer_size,
             config.max_seed_freq,
         );
         log::info!("[stage] containment_rank: {} hits", containment_hits.len());
