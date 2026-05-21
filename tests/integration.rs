@@ -165,7 +165,9 @@ fn test_elias_fano_many_unitigs() {
     assert_eq!(idx.num_unitigs(), 200);
     assert_eq!(idx.total_length(), lengths.iter().sum::<u64>());
 
-    // Verify every position maps correctly
+    // Verify every position maps correctly. The FM-index text places a
+    // 1-byte '$' separator after each unitig, so unitig i starts at text
+    // position sum(len[0..i]) + i — advance `pos` by `len + 1` per unitig.
     let mut pos = 0u64;
     for (uid, &len) in lengths.iter().enumerate() {
         let (mapped_uid, offset) = idx.unitig_at_position(pos).unwrap();
@@ -177,7 +179,10 @@ fn test_elias_fano_many_unitigs() {
             assert_eq!(mapped_uid, uid as u32, "End of unitig {}", uid);
             assert_eq!(offset, (len - 1) as u32);
         }
-        pos += len;
+        // The byte right after the unitig is the '$' separator.
+        assert!(idx.unitig_at_position(pos + len).is_none(),
+                "'$' separator after unitig {}", uid);
+        pos += len + 1;
     }
 
     // Past the end

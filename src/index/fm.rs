@@ -381,19 +381,21 @@ mod tests {
         let hits = index.search(b"TTGG");
         assert_eq!(hits.len(), 1);
 
-        // Map positions to unitigs
+        // Map positions to unitigs. Text "ACGTACGT$TTGGCCAA$":
+        //   unitig 0 = text[0..8), '$' @ 8, unitig 1 = text[9..17), '$' @ 17.
         let (uid, offset) = index.position_to_unitig(0).unwrap();
-        assert_eq!(uid, 0);
-        assert_eq!(offset, 0);
+        assert_eq!((uid, offset), (0, 0));
+        let (uid, offset) = index.position_to_unitig(7).unwrap();
+        assert_eq!((uid, offset), (0, 7)); // last base of unitig 0
 
-        // Position 9 in text "ACGTACGT$TTGGCCAA$" is 'T' (first char of unitig 1).
-        // CumulativeLengthIndex maps using unitig lengths [8, 8], so cumulative = [0, 8, 16].
-        // Position 9 -> unitig 1, offset 9-8=1. But we want the separator to be skipped.
-        // In production, the concatenation would account for separators in the length index.
-        // For now, verify the mapping is consistent:
-        let (uid, offset) = index.position_to_unitig(8).unwrap();
-        assert_eq!(uid, 1); // position 8 = start of unitig 1
-        assert_eq!(offset, 0);
+        // Position 8 is the '$' separator — not inside any unitig.
+        assert_eq!(index.position_to_unitig(8), None);
+
+        // Position 9 is the first base of unitig 1 (separator correctly skipped).
+        let (uid, offset) = index.position_to_unitig(9).unwrap();
+        assert_eq!((uid, offset), (1, 0));
+        let (uid, offset) = index.position_to_unitig(16).unwrap();
+        assert_eq!((uid, offset), (1, 7)); // last base of unitig 1
     }
 
     #[test]

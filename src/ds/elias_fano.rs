@@ -28,29 +28,49 @@ impl CumulativeLengthIndex {
         Self { cum_lengths }
     }
 
-    /// Given a position in the concatenated text, return (unitig_id, offset_within_unitig).
+    /// Given a position in the concatenated FM-index text, return
+    /// `(unitig_id, offset_within_unitig)`.
+    ///
+    /// **Separator awareness.** The FM-index text concatenates unitig
+    /// sequences with a 1-byte `$` separator *after each unitig* (see
+    /// [`crate::index::unitig::UnitigSet`]). `cum_lengths`, however, stores
+    /// separator-*free* cumulative sums (it is built from raw unitig
+    /// lengths). Therefore unitig `i` begins at text position
+    /// `cum_lengths[i] + i` — there are `i` separators in front of it — and
+    /// its `$` sits at `cum_lengths[i] + i + len_i`.
+    ///
+    /// Mapping a text position with the raw `cum_lengths` boundaries (as a
+    /// previous version did) yields an offset inflated by the unitig index
+    /// — e.g. `+1867` for unitig 1867 — and, for large indices, the wrong
+    /// unitig entirely. That mis-anchored every FM seed and was the root
+    /// cause of the saureus `mean_id 0.624` ceiling.
     pub fn unitig_at_position(&self, pos: u64) -> Option<(u32, u32)> {
-        if self.cum_lengths.len() < 2 {
+        let n = self.num_unitigs();
+        if n == 0 {
             return None;
         }
-        // Binary search for the rightmost cumulative length <= pos
-        let idx = match self.cum_lengths.binary_search(&pos) {
-            Ok(i) => {
-                // Exact match: pos is at the start of unitig i (or end sentinel)
-                if i >= self.cum_lengths.len() - 1 {
-                    return None; // past the end
-                }
-                i
+        // text_start(i) = cum_lengths[i] + i is strictly increasing, so we
+        // can binary-search it for the rightmost start <= pos.
+        let text_start = |i: usize| self.cum_lengths[i] + i as u64;
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if text_start(mid) <= pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
-            Err(i) => {
-                if i == 0 {
-                    return None;
-                }
-                i - 1
-            }
-        };
-
-        let offset = pos - self.cum_lengths[idx];
+        }
+        if lo == 0 {
+            return None; // pos precedes the first unitig
+        }
+        let idx = lo - 1;
+        let offset = pos - text_start(idx);
+        let len = self.cum_lengths[idx + 1] - self.cum_lengths[idx];
+        if offset >= len {
+            // pos falls on the '$' separator after unitig `idx`.
+            return None;
+        }
         Some((idx as u32, offset as u32))
     }
 
@@ -91,28 +111,26 @@ impl CumulativeLengthIndex {
 mod tests {
     use super::*;
 
+    // The FM-index text concatenates unitigs with a 1-byte '$' separator
+    // after each. For lengths [100, 200, 150] the text layout is:
+    //   unitig 0 : text[0  .. 100)   '$' @ 100
+    //   unitig 1 : text[101 .. 301)  '$' @ 301
+    //   unitig 2 : text[302 .. 452)  '$' @ 452
     #[test]
     fn test_basic_lookup() {
-        // 3 unitigs of length 100, 200, 150
         let idx = CumulativeLengthIndex::from_lengths(&[100, 200, 150]);
-
         assert_eq!(idx.num_unitigs(), 3);
-        assert_eq!(idx.total_length(), 450);
 
-        // Position 0 -> unitig 0, offset 0
         assert_eq!(idx.unitig_at_position(0), Some((0, 0)));
-        // Position 99 -> unitig 0, offset 99
         assert_eq!(idx.unitig_at_position(99), Some((0, 99)));
-        // Position 100 -> unitig 1, offset 0
-        assert_eq!(idx.unitig_at_position(100), Some((1, 0)));
-        // Position 299 -> unitig 1, offset 199
-        assert_eq!(idx.unitig_at_position(299), Some((1, 199)));
-        // Position 300 -> unitig 2, offset 0
-        assert_eq!(idx.unitig_at_position(300), Some((2, 0)));
-        // Position 449 -> unitig 2, offset 149
-        assert_eq!(idx.unitig_at_position(449), Some((2, 149)));
-        // Position 450 -> past end
-        assert_eq!(idx.unitig_at_position(450), None);
+        assert_eq!(idx.unitig_at_position(100), None); // '$' after unitig 0
+        assert_eq!(idx.unitig_at_position(101), Some((1, 0)));
+        assert_eq!(idx.unitig_at_position(300), Some((1, 199)));
+        assert_eq!(idx.unitig_at_position(301), None); // '$' after unitig 1
+        assert_eq!(idx.unitig_at_position(302), Some((2, 0)));
+        assert_eq!(idx.unitig_at_position(451), Some((2, 149)));
+        assert_eq!(idx.unitig_at_position(452), None); // '$' after unitig 2
+        assert_eq!(idx.unitig_at_position(453), None); // past end
     }
 
     #[test]
@@ -120,6 +138,23 @@ mod tests {
         let idx = CumulativeLengthIndex::from_lengths(&[500]);
         assert_eq!(idx.unitig_at_position(0), Some((0, 0)));
         assert_eq!(idx.unitig_at_position(499), Some((0, 499)));
-        assert_eq!(idx.unitig_at_position(500), None);
+        assert_eq!(idx.unitig_at_position(500), None); // '$' separator
+    }
+
+    /// Regression test for the saureus `mean_id 0.624` bug: with many
+    /// unitigs, a position deep in the text must map to an offset that is
+    /// NOT inflated by the unitig index. Here every unitig is 10 bp, so
+    /// unitig i occupies text[11*i .. 11*i + 10) and unitig i's first base
+    /// is at text position 11*i.
+    #[test]
+    fn test_many_unitigs_offset_not_inflated() {
+        let idx = CumulativeLengthIndex::from_lengths(&vec![10u64; 2000]);
+        for i in [0usize, 1, 500, 1867, 1999] {
+            let base = (11 * i) as u64; // start of unitig i in separator-ful text
+            assert_eq!(idx.unitig_at_position(base), Some((i as u32, 0)));
+            assert_eq!(idx.unitig_at_position(base + 7), Some((i as u32, 7)));
+            assert_eq!(idx.unitig_at_position(base + 9), Some((i as u32, 9)));
+            assert_eq!(idx.unitig_at_position(base + 10), None); // '$'
+        }
     }
 }
