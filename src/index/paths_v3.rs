@@ -339,14 +339,22 @@ pub fn migrate_v2_to_v3(v2_path: &Path, v3_path: &Path) -> Result<MigrationV3Sta
 // Mmap reader
 // ---------------------------------------------------------------------------
 
-/// Lazy, mmap-backed view over a v3 paths file.
+/// Mmap-backed view over a v3 paths file.
+///
+/// The per-genome blob section stays mmap'd (each `get_path` reads one
+/// blob sequentially). The successor CSR table and the genome offset
+/// table are pulled into RAM at open time (~49 MB/shard total): they are
+/// random-accessed ~1.3M times per path decode, and serving that through
+/// the mmap faults scattered 4 KB pages from (often networked) storage —
+/// a measured ~2x search slowdown. 49 MB resident is negligible against
+/// the laptop RAM budget.
 pub struct MmapPathIndexV3 {
     mmap: Mmap,
     num_genomes: u64,
     num_nodes: u64,
-    succ_offsets_pos: usize,
-    succ_values_pos: usize,
-    genome_table_pos: usize,
+    succ_offsets: Vec<u64>,
+    succ_values: Vec<u32>,
+    genome_offsets: Vec<u64>,
 }
 
 impl MmapPathIndexV3 {
@@ -372,16 +380,43 @@ impl MmapPathIndexV3 {
         let num_nodes = num_unitigs * 2;
 
         let table_end = genome_table_pos + (num_genomes as usize + 1) * 8;
-        if mmap.len() < table_end {
-            bail!("v3 file truncated within tables");
+        if mmap.len() < table_end || succ_values_pos < succ_offsets_pos
+            || genome_table_pos < succ_values_pos
+        {
+            bail!("v3 file truncated or malformed within tables");
         }
+
+        // Pull the randomly-accessed tables into RAM (one sequential read each).
+        let read_u64_table = |start: usize, end: usize| -> Result<Vec<u64>> {
+            if (end - start) % 8 != 0 {
+                bail!("v3 u64 table not 8-byte aligned");
+            }
+            Ok((start..end)
+                .step_by(8)
+                .map(|p| u64::from_le_bytes(mmap[p..p + 8].try_into().unwrap()))
+                .collect())
+        };
+        let succ_offsets = read_u64_table(succ_offsets_pos, succ_values_pos)?;
+        if succ_offsets.len() != num_nodes as usize + 1 {
+            bail!(
+                "v3 succ_offsets length {} != num_nodes+1 {}",
+                succ_offsets.len(),
+                num_nodes + 1
+            );
+        }
+        let succ_values: Vec<u32> = (succ_values_pos..genome_table_pos)
+            .step_by(4)
+            .map(|p| u32::from_le_bytes(mmap[p..p + 4].try_into().unwrap()))
+            .collect();
+        let genome_offsets = read_u64_table(genome_table_pos, table_end)?;
+
         Ok(Self {
             mmap,
             num_genomes,
             num_nodes,
-            succ_offsets_pos,
-            succ_values_pos,
-            genome_table_pos,
+            succ_offsets,
+            succ_values,
+            genome_offsets,
         })
     }
 
@@ -389,19 +424,19 @@ impl MmapPathIndexV3 {
         self.num_genomes
     }
 
+    #[inline]
     fn succ_offset(&self, node: u64) -> u64 {
-        let p = self.succ_offsets_pos + (node as usize) * 8;
-        u64::from_le_bytes(self.mmap[p..p + 8].try_into().unwrap())
+        self.succ_offsets[node as usize]
     }
 
+    #[inline]
     fn succ_value(&self, idx: u64) -> u32 {
-        let p = self.succ_values_pos + (idx as usize) * 4;
-        u32::from_le_bytes(self.mmap[p..p + 4].try_into().unwrap())
+        self.succ_values[idx as usize]
     }
 
+    #[inline]
     fn genome_offset(&self, i: u64) -> u64 {
-        let p = self.genome_table_pos + (i as usize) * 8;
-        u64::from_le_bytes(self.mmap[p..p + 8].try_into().unwrap())
+        self.genome_offsets[i as usize]
     }
 
     /// Decode genome `genome_id`'s path. Reconstructs the same `GenomePath`
