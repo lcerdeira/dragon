@@ -45,6 +45,9 @@ pub enum PathIndex {
     Eager(std::sync::Arc<Vec<GenomePath>>),
     /// Lazy v2 view; only the offset table is mmap-resident at idle.
     Mmap(std::sync::Arc<crate::index::paths_v2::MmapPathIndex>),
+    /// Lazy v3 (graph-edge) view; shared CSR successor table + per-genome
+    /// edge-index blobs. ~2-4x smaller on disk than v2.
+    MmapV3(std::sync::Arc<crate::index::paths_v3::MmapPathIndexV3>),
 }
 
 /// Bincode-friendly shadow type for the legacy on-disk format. Keeping the
@@ -68,6 +71,7 @@ impl PathIndex {
         match self {
             Self::Eager(v) => v.get(genome_id as usize).cloned(),
             Self::Mmap(m) => m.get_path(genome_id).ok().flatten(),
+            Self::MmapV3(m) => m.get_path(genome_id).ok().flatten(),
         }
     }
 
@@ -75,6 +79,7 @@ impl PathIndex {
         match self {
             Self::Eager(v) => v.len(),
             Self::Mmap(m) => m.num_genomes() as usize,
+            Self::MmapV3(m) => m.num_genomes() as usize,
         }
     }
 
@@ -85,6 +90,11 @@ impl PathIndex {
         match self {
             Self::Eager(v) => Box::new(v.iter().cloned()),
             Self::Mmap(m) => {
+                let n = m.num_genomes();
+                let m = m.clone();
+                Box::new((0..n).filter_map(move |gid| m.get_path(gid as u32).ok().flatten()))
+            }
+            Self::MmapV3(m) => {
                 let n = m.num_genomes();
                 let m = m.clone();
                 Box::new((0..n).filter_map(move |gid| m.get_path(gid as u32).ok().flatten()))
@@ -425,7 +435,10 @@ pub fn build_path_index(
 ///     first.
 pub fn load_path_index(index_dir: &Path) -> Result<PathIndex> {
     let path_file = index_dir.join("paths.bin");
-    if crate::index::paths_v2::is_v2(&path_file)? {
+    if crate::index::paths_v3::is_v3(&path_file)? {
+        let mmap_idx = crate::index::paths_v3::MmapPathIndexV3::open(&path_file)?;
+        Ok(PathIndex::MmapV3(std::sync::Arc::new(mmap_idx)))
+    } else if crate::index::paths_v2::is_v2(&path_file)? {
         let mmap_idx = crate::index::paths_v2::MmapPathIndex::open(&path_file)?;
         Ok(PathIndex::Mmap(std::sync::Arc::new(mmap_idx)))
     } else {
