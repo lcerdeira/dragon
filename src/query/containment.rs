@@ -56,134 +56,140 @@ pub fn containment_rank(
     let total_genomes = color_index.num_genomes();
     let total_query_kmers = query.len() - kmer_size + 1;
 
-    // Per-genome accumulators
-    let mut genome_shared: HashMap<u32, usize> = HashMap::new();
-    let mut genome_info: HashMap<u32, f64> = HashMap::new();
-    let mut genome_seeds: HashMap<u32, Vec<SeedHit>> = HashMap::new();
+    /// One query position's FM-index hit: the distinct unitigs it maps to,
+    /// with a representative seed per unitig.
+    struct KmerHit {
+        qpos: usize,
+        is_reverse: bool,
+        unitigs: Vec<u32>,
+        seeds: Vec<SeedHit>,
+    }
 
-    // Track which query positions already contributed (avoid double-counting overlapping seeds)
-    let mut counted_positions = vec![false; query.len()];
+    // ---- Phase 1: collect k-mer hits; deserialize each unitig's color set
+    // exactly ONCE for the whole query (not once per k-mer). ----
+    let mut kmer_hits: Vec<KmerHit> = Vec::new();
+    let mut unitig_colors: HashMap<u32, RoaringBitmap> = HashMap::new();
 
-    // Search both strands
     for (seq, is_reverse) in [(query.to_vec(), false), (reverse_complement(query), true)] {
         if seq.len() < kmer_size {
             continue;
         }
-
         for qpos in 0..=seq.len() - kmer_size {
             let kmer = &seq[qpos..qpos + kmer_size];
-
-            // Skip k-mers with N
             if kmer.iter().any(|&b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't')) {
                 continue;
             }
-
-            // Search in FM-index
             let positions = fm_index.search(kmer);
             if positions.is_empty() || positions.len() > max_seed_freq {
                 continue;
             }
-
-            // Map each position to a unitig, collect unique unitigs
-            let mut hit_unitigs = RoaringBitmap::new();
-            let mut unitig_seeds: Vec<SeedHit> = Vec::new();
-
+            let actual_qpos = if is_reverse {
+                seq.len() - qpos - kmer_size
+            } else {
+                qpos
+            };
+            let mut seen = RoaringBitmap::new();
+            let mut unitigs: Vec<u32> = Vec::new();
+            let mut seeds: Vec<SeedHit> = Vec::new();
             for &pos in &positions {
                 if let Some((unitig_id, offset)) = fm_index.position_to_unitig(pos) {
-                    if hit_unitigs.insert(unitig_id) {
-                        let hit_qpos = if is_reverse {
-                            seq.len() - qpos - kmer_size
-                        } else {
-                            qpos
-                        };
-                        unitig_seeds.push(SeedHit {
+                    if seen.insert(unitig_id) {
+                        unitigs.push(unitig_id);
+                        seeds.push(SeedHit {
                             unitig_id,
                             offset,
-                            query_pos: hit_qpos,
+                            query_pos: actual_qpos,
                             match_len: kmer_size,
                             is_reverse,
                             sa_count: positions.len(),
                         });
+                        unitig_colors.entry(unitig_id).or_insert_with(|| {
+                            color_index.get_colors(unitig_id).unwrap_or_default()
+                        });
                     }
                 }
             }
-
-            // CRITICAL: deserialize each unitig's color set EXACTLY ONCE per
-            // k-mer. The previous implementation re-deserialized inside a
-            // triple-nested loop (kmer × unitig × genome × seed), producing
-            // billions of small RoaringBitmap allocations and 100+ GB of
-            // allocator pressure on indices with ≥10K genomes. See issue #4.
-            let unitig_color_map: HashMap<u32, RoaringBitmap> = hit_unitigs
-                .iter()
-                .filter_map(|uid| {
-                    color_index.get_colors(uid).ok().map(|c| (uid, c))
-                })
-                .collect();
-
-            // Pre-group seeds by their unitig_id so we can look up "which
-            // seeds are in this genome" without an inner color lookup.
-            let mut seeds_by_unitig: HashMap<u32, Vec<&SeedHit>> = HashMap::new();
-            for seed in &unitig_seeds {
-                seeds_by_unitig.entry(seed.unitig_id).or_default().push(seed);
+            if !unitigs.is_empty() {
+                kmer_hits.push(KmerHit { qpos: actual_qpos, is_reverse, unitigs, seeds });
             }
+        }
+    }
+    if kmer_hits.is_empty() {
+        return Vec::new();
+    }
 
-            // For each unique unitig hit, credit the genomes that contain it.
-            for unitig_id in hit_unitigs.iter() {
-                let colors = match unitig_color_map.get(&unitig_id) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let cardinality = colors.len();
-                let ic = if cardinality > 0 && total_genomes > 0 {
-                    (total_genomes as f64 / cardinality as f64).log2()
-                } else {
-                    0.0
-                };
+    // ---- Phase 2: select candidate genomes from the most SPECIFIC unitigs.
+    //
+    // A unitig shared by a large fraction of genomes (core genome) carries
+    // almost no ranking signal, yet crediting it costs O(cardinality) — on
+    // the 16K-genome saureus shards that meant crediting ~all genomes for
+    // every k-mer, an O(genomes) pass per query and a ~16K-entry result.
+    //
+    // Instead, build the candidate set greedily from the lowest-cardinality
+    // (most specific) unitigs until it is large enough. The true source
+    // genome — and any genome that genuinely contains the query — shares the
+    // query's most specific k-mers, so it is always captured. ----
+    const CANDIDATE_TARGET: u64 = 2000;
+    let mut by_card: Vec<(u32, u64)> = unitig_colors
+        .iter()
+        .map(|(uid, c)| (*uid, c.len()))
+        .collect();
+    by_card.sort_by_key(|&(_, card)| card);
 
-                let actual_qpos = if is_reverse {
-                    seq.len() - qpos - kmer_size
-                } else {
-                    qpos
-                };
+    let mut candidate_set = RoaringBitmap::new();
+    for (uid, _card) in &by_card {
+        if candidate_set.len() >= CANDIDATE_TARGET {
+            break;
+        }
+        if let Some(colors) = unitig_colors.get(uid) {
+            candidate_set |= colors;
+        }
+    }
+    if candidate_set.is_empty() {
+        return Vec::new();
+    }
 
-                for genome_id in colors.iter() {
-                    if !counted_positions[actual_qpos] {
-                        *genome_shared.entry(genome_id).or_insert(0) += 1;
-                    }
-                    *genome_info.entry(genome_id).or_insert(0.0) += ic;
+    // ---- Phase 3: score ONLY candidate genomes. Each hit unitig's color set
+    // is intersected with the candidate set (fast Roaring AND), so per-k-mer
+    // work is bounded by the candidate set, not the whole genome collection. ----
+    const MAX_SEEDS_PER_GENOME: usize = 64;
+    let mut genome_shared: HashMap<u32, usize> = HashMap::new();
+    let mut genome_info: HashMap<u32, f64> = HashMap::new();
+    let mut genome_seeds: HashMap<u32, Vec<SeedHit>> = HashMap::new();
+    let mut counted_positions = vec![false; query.len()];
 
-                    // For each unitig hit by this k-mer, push its seeds into
-                    // this genome's bucket — but cap the bucket. direct_align
-                    // only needs a handful of anchor seeds per candidate; with
-                    // 16K-genome × 1K-unitig × 50-kmer queries, an uncapped
-                    // bucket grows to tens of GB and OOMs the process.
-                    const MAX_SEEDS_PER_GENOME: usize = 64;
-                    let bucket = genome_seeds.entry(genome_id).or_default();
-                    if bucket.len() >= MAX_SEEDS_PER_GENOME {
-                        continue;
-                    }
-                    for (other_uid, other_seeds) in &seeds_by_unitig {
-                        if bucket.len() >= MAX_SEEDS_PER_GENOME {
-                            break;
-                        }
-                        if let Some(other_colors) = unitig_color_map.get(other_uid) {
-                            if other_colors.contains(genome_id) {
-                                for s in other_seeds {
-                                    if bucket.len() >= MAX_SEEDS_PER_GENOME {
-                                        break;
-                                    }
-                                    bucket.push((*s).clone());
-                                }
-                            }
-                        }
-                    }
+    for kh in &kmer_hits {
+        for (idx, uid) in kh.unitigs.iter().enumerate() {
+            let colors = match unitig_colors.get(uid) {
+                Some(c) => c,
+                None => continue,
+            };
+            let credited = colors & &candidate_set;
+            if credited.is_empty() {
+                continue;
+            }
+            let cardinality = colors.len();
+            let ic = if cardinality > 0 && total_genomes > 0 {
+                (total_genomes as f64 / cardinality as f64).log2()
+            } else {
+                0.0
+            };
+            let count_this = !counted_positions[kh.qpos];
+            let seed = &kh.seeds[idx];
+            for genome_id in credited.iter() {
+                if count_this {
+                    *genome_shared.entry(genome_id).or_insert(0) += 1;
+                }
+                *genome_info.entry(genome_id).or_insert(0.0) += ic;
+                let bucket = genome_seeds.entry(genome_id).or_default();
+                if bucket.len() < MAX_SEEDS_PER_GENOME {
+                    bucket.push(seed.clone());
                 }
             }
-
-            // Mark this position as counted (for first strand that matches)
-            if !hit_unitigs.is_empty() && !is_reverse {
-                counted_positions[qpos] = true;
-            }
+        }
+        // Mark this query position counted (forward strand runs first).
+        if !kh.is_reverse {
+            counted_positions[kh.qpos] = true;
         }
     }
 

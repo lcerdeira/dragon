@@ -165,20 +165,24 @@ pub fn search(
         log::info!("[stage] find_seeds: {} seeds", seeds.len());
         log_rss!("after-find_seeds");
 
-        // Stage 2: Identify candidate genomes via color voting
-        // Adaptive threshold: use at most 20% of seed count, but at least 2
-        let min_votes = if seeds.is_empty() {
-            base_min_votes
-        } else {
-            base_min_votes.min((seeds.len() as u32 / 5).max(2))
-        };
-        let candidates = candidate::find_candidates(&seeds, &color_index, min_votes);
-        log::info!("[stage] find_candidates: {} candidates", candidates.len());
-        log_rss!("after-find_candidates");
-
-        // Dump seeds with full ML features if requested (for training data generation)
+        // Stage 2: candidate genomes via color voting.
+        //
+        // `find_candidates` is consumed ONLY by the optional ML seed-dump
+        // below — the live search path (Stage 3 onward) ranks genomes with
+        // `containment_rank`. Running it unconditionally cost an ~O(genomes)
+        // pass per query (≈3 s/query/shard on the 16K-genome saureus shards)
+        // for output that was then thrown away. Gate it behind --dump-seeds.
         if let Some(ref mut writer) = seed_dump {
             use std::io::Write;
+            // Adaptive vote threshold: at most 20% of seed count, but >= 2.
+            let min_votes = if seeds.is_empty() {
+                base_min_votes
+            } else {
+                base_min_votes.min((seeds.len() as u32 / 5).max(2))
+            };
+            let candidates = candidate::find_candidates(&seeds, &color_index, min_votes);
+            log::info!("[stage] find_candidates: {} candidates", candidates.len());
+
             // Collect all seed positions for local density computation
             let all_positions: Vec<usize> = candidates
                 .iter()
