@@ -54,7 +54,15 @@ pub fn containment_rank(
     }
 
     let total_genomes = color_index.num_genomes();
-    let total_query_kmers = query.len() - kmer_size + 1;
+    let total_kmers = query.len() - kmer_size + 1;
+
+    // Containment is a RANKING statistic, so we SAMPLE k-mers rather than
+    // scan every position. A few hundred sampled k-mers estimate containment
+    // as well as all ~N of them, at a fraction of the FM-index lookups and
+    // genome-crediting — the dominant per-query cost on large shards. Exact
+    // identity is re-derived downstream by direct_align.
+    const TARGET_SAMPLES: usize = 200;
+    let stride = (total_kmers / TARGET_SAMPLES).max(1);
 
     /// One query position's FM-index hit: the distinct unitigs it maps to,
     /// with a representative seed per unitig.
@@ -65,54 +73,55 @@ pub fn containment_rank(
         seeds: Vec<SeedHit>,
     }
 
-    // ---- Phase 1: collect k-mer hits; deserialize each unitig's color set
-    // exactly ONCE for the whole query (not once per k-mer). ----
+    // ---- Phase 1: collect sampled k-mer hits; deserialize each unitig's
+    // color set exactly ONCE for the whole query (not once per k-mer). ----
     let mut kmer_hits: Vec<KmerHit> = Vec::new();
     let mut unitig_colors: HashMap<u32, RoaringBitmap> = HashMap::new();
+    let mut n_sampled = 0usize;
 
-    for (seq, is_reverse) in [(query.to_vec(), false), (reverse_complement(query), true)] {
-        if seq.len() < kmer_size {
-            continue;
-        }
-        for qpos in 0..=seq.len() - kmer_size {
-            let kmer = &seq[qpos..qpos + kmer_size];
-            if kmer.iter().any(|&b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't')) {
-                continue;
-            }
-            let positions = fm_index.search(kmer);
-            if positions.is_empty() || positions.len() > max_seed_freq {
-                continue;
-            }
-            let actual_qpos = if is_reverse {
-                seq.len() - qpos - kmer_size
-            } else {
-                qpos
-            };
-            let mut seen = RoaringBitmap::new();
-            let mut unitigs: Vec<u32> = Vec::new();
-            let mut seeds: Vec<SeedHit> = Vec::new();
-            for &pos in &positions {
-                if let Some((unitig_id, offset)) = fm_index.position_to_unitig(pos) {
-                    if seen.insert(unitig_id) {
-                        unitigs.push(unitig_id);
-                        seeds.push(SeedHit {
-                            unitig_id,
-                            offset,
-                            query_pos: actual_qpos,
-                            match_len: kmer_size,
-                            is_reverse,
-                            sa_count: positions.len(),
-                        });
-                        unitig_colors.entry(unitig_id).or_insert_with(|| {
-                            color_index.get_colors(unitig_id).unwrap_or_default()
-                        });
+    let mut p = 0usize;
+    while p + kmer_size <= query.len() {
+        n_sampled += 1;
+        let fwd = &query[p..p + kmer_size];
+        let has_ambig = fwd
+            .iter()
+            .any(|&b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'));
+        if !has_ambig {
+            // Search the k-mer on both strands (forward first, so the
+            // forward hit marks the position before the reverse one).
+            let rc = reverse_complement(fwd);
+            for (kmer, is_reverse) in [(fwd.to_vec(), false), (rc, true)] {
+                let positions = fm_index.search(&kmer);
+                if positions.is_empty() || positions.len() > max_seed_freq {
+                    continue;
+                }
+                let mut seen = RoaringBitmap::new();
+                let mut unitigs: Vec<u32> = Vec::new();
+                let mut seeds: Vec<SeedHit> = Vec::new();
+                for &pos in &positions {
+                    if let Some((unitig_id, offset)) = fm_index.position_to_unitig(pos) {
+                        if seen.insert(unitig_id) {
+                            unitigs.push(unitig_id);
+                            seeds.push(SeedHit {
+                                unitig_id,
+                                offset,
+                                query_pos: p,
+                                match_len: kmer_size,
+                                is_reverse,
+                                sa_count: positions.len(),
+                            });
+                            unitig_colors.entry(unitig_id).or_insert_with(|| {
+                                color_index.get_colors(unitig_id).unwrap_or_default()
+                            });
+                        }
                     }
                 }
-            }
-            if !unitigs.is_empty() {
-                kmer_hits.push(KmerHit { qpos: actual_qpos, is_reverse, unitigs, seeds });
+                if !unitigs.is_empty() {
+                    kmer_hits.push(KmerHit { qpos: p, is_reverse, unitigs, seeds });
+                }
             }
         }
+        p += stride;
     }
     if kmer_hits.is_empty() {
         return Vec::new();
@@ -198,9 +207,10 @@ pub fn containment_rank(
         .into_iter()
         .map(|(genome_id, shared)| ContainmentHit {
             genome_id,
-            containment: shared as f64 / total_query_kmers.max(1) as f64,
+            // containment estimated over the sampled k-mers
+            containment: shared as f64 / n_sampled.max(1) as f64,
             shared_kmers: shared,
-            total_query_kmers,
+            total_query_kmers: n_sampled,
             info_score: genome_info.get(&genome_id).copied().unwrap_or(0.0),
             seeds: genome_seeds.remove(&genome_id).unwrap_or_default(),
         })
