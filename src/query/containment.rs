@@ -61,7 +61,11 @@ pub fn containment_rank(
     // as well as all ~N of them, at a fraction of the FM-index lookups and
     // genome-crediting — the dominant per-query cost on large shards. Exact
     // identity is re-derived downstream by direct_align.
-    const TARGET_SAMPLES: usize = 200;
+    //
+    // 384 samples keeps the perfect-hit rate on par with a full scan; a
+    // 200-sample setting was faster still but occasionally missed a
+    // localized match (perfect-rate 0.975 vs 0.980 on the saureus benchmark).
+    const TARGET_SAMPLES: usize = 384;
     let stride = (total_kmers / TARGET_SAMPLES).max(1);
 
     /// One query position's FM-index hit: the distinct unitigs it maps to,
