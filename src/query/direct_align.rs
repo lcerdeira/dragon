@@ -16,7 +16,9 @@
 use lib::alignment_lib::{Alignment, Penalties};
 use lib::wavefront_alignment::wavefront_align;
 
-use crate::index::paths::PathIndex;
+use std::collections::HashMap;
+
+use crate::index::paths::{PathIndex, PathStep};
 use crate::index::unitig::UnitigSet;
 use crate::io::paf::PafRecord;
 use crate::query::containment::ContainmentHit;
@@ -79,6 +81,17 @@ pub fn direct_align_candidates(
             continue;
         }
 
+        // Index this genome's steps by unitig_id once. Seed→step lookup is
+        // then O(1) instead of an O(num_steps) linear scan per seed — on the
+        // saureus shards a genome has ~650K steps and a query carries up to
+        // 64 seeds × 2 strands, so the old `.find()` was ~10^8 iterations
+        // per candidate. First insert wins, matching `.find()`'s semantics.
+        let mut unitig_step: HashMap<u32, &PathStep> =
+            HashMap::with_capacity(genome_path.steps.len());
+        for st in &genome_path.steps {
+            unitig_step.entry(st.unitig_id).or_insert(st);
+        }
+
         if hit.seeds.is_empty() {
             // No seed anchors — fall back to a containment-only summary row.
             // No CIGAR is emitted (we have no aligned region).
@@ -114,10 +127,8 @@ pub fn direct_align_candidates(
         let mut fwd_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
         let mut rev_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
         for s in &hit.seeds {
-            let step_rev = genome_path
-                .steps
-                .iter()
-                .find(|st| st.unitig_id == s.unitig_id)
+            let step_rev = unitig_step
+                .get(&s.unitig_id)
                 .map(|st| st.is_reverse)
                 .unwrap_or(false);
             if s.is_reverse == step_rev {
@@ -128,12 +139,12 @@ pub fn direct_align_candidates(
         }
 
         if let Some(record) = align_with_seeds(
-            query, query_name, &fwd_seeds, hit, &genome_path, unitigs, candidates, false,
+            query, query_name, &fwd_seeds, hit, &genome_path, &unitig_step, unitigs, candidates, false,
         ) {
             records.push(record);
         }
         if let Some(record) = align_with_seeds(
-            query, query_name, &rev_seeds, hit, &genome_path, unitigs, candidates, true,
+            query, query_name, &rev_seeds, hit, &genome_path, &unitig_step, unitigs, candidates, true,
         ) {
             records.push(record);
         }
@@ -154,6 +165,7 @@ fn align_with_seeds(
     seeds: &[&crate::index::fm::SeedHit],
     hit: &ContainmentHit,
     genome_path: &crate::index::paths::GenomePath,
+    unitig_step: &HashMap<u32, &PathStep>,
     unitigs: &UnitigSet,
     all_candidates: &[ContainmentHit],
     is_reverse: bool,
@@ -177,11 +189,7 @@ fn align_with_seeds(
     // correct genome anchor coordinates.
     let mut anchors: Vec<(u64, usize, usize)> = Vec::new();
     for seed in seeds {
-        if let Some(step) = genome_path
-            .steps
-            .iter()
-            .find(|s| s.unitig_id == seed.unitig_id)
-        {
+        if let Some(&step) = unitig_step.get(&seed.unitig_id) {
             let unitig_len = unitigs
                 .unitigs
                 .get(seed.unitig_id as usize)
