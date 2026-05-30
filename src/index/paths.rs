@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::index::unitig::UnitigSet;
@@ -48,6 +48,10 @@ pub enum PathIndex {
     /// Lazy v3 (graph-edge) view; shared CSR successor table + per-genome
     /// edge-index blobs. ~2-4x smaller on disk than v2.
     MmapV3(std::sync::Arc<crate::index::paths_v3::MmapPathIndexV3>),
+    /// Lazy v4 view: graph-edge encoding plus per-genome checkpoint tables.
+    /// Supports `iter_window` (fast windowed decode) and `find_unitig_steps`
+    /// (early-exit anchor lookup) without materialising the full path.
+    MmapV4(std::sync::Arc<crate::index::paths_v4::MmapPathIndexV4>),
 }
 
 /// Bincode-friendly shadow type for the legacy on-disk format. Keeping the
@@ -72,6 +76,7 @@ impl PathIndex {
             Self::Eager(v) => v.get(genome_id as usize).cloned(),
             Self::Mmap(m) => m.get_path(genome_id).ok().flatten(),
             Self::MmapV3(m) => m.get_path(genome_id).ok().flatten(),
+            Self::MmapV4(m) => m.get_path(genome_id).ok().flatten(),
         }
     }
 
@@ -80,6 +85,77 @@ impl PathIndex {
             Self::Eager(v) => v.len(),
             Self::Mmap(m) => m.num_genomes() as usize,
             Self::MmapV3(m) => m.num_genomes() as usize,
+            Self::MmapV4(m) => m.num_genomes() as usize,
+        }
+    }
+
+    /// Read just the genome's name and total length. Fast on v4; falls
+    /// back to a full `get_path` decode on older formats.
+    pub fn genome_meta(&self, genome_id: u32) -> Option<(String, u64)> {
+        match self {
+            Self::MmapV4(m) => m.genome_meta(genome_id).ok().flatten(),
+            other => other
+                .get_path(genome_id)
+                .map(|g| (g.genome_name, g.genome_length)),
+        }
+    }
+
+    /// Decode the steps of a genome that overlap (loosely) with the genome
+    /// window `[start, end)` — every emitted step has `genome_offset < end`,
+    /// and the first emitted step may have `genome_offset <= start` (so
+    /// that callers can compute the precise window against `step_end`).
+    ///
+    /// On v4 this seeks to the latest per-genome checkpoint at or before
+    /// `start` and decodes only the window — ~1 ms on the saureus shards.
+    /// Older formats fall back to a full `get_path` decode then filter.
+    pub fn iter_window(&self, genome_id: u32, start: u64, end: u64) -> Vec<PathStep> {
+        match self {
+            Self::MmapV4(m) => m
+                .iter_window(genome_id, start, end)
+                .unwrap_or_default(),
+            other => other
+                .get_path(genome_id)
+                .map(|g| {
+                    g.steps
+                        .into_iter()
+                        .filter(|s| s.genome_offset < end)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// For each unitig_id in `wanted`, return the first `PathStep` (in path
+    /// order) whose `unitig_id` matches. Used by `direct_align` to resolve
+    /// seed anchors without materialising the full 650 k-step path.
+    ///
+    /// On v4 this walks the step stream from the start with **early-exit**
+    /// as soon as every wanted unitig has been found — typically a handful
+    /// of milliseconds for clustered seeds. Older formats fall back to a
+    /// full `get_path` decode followed by a linear scan.
+    pub fn find_unitig_steps(
+        &self,
+        genome_id: u32,
+        wanted: &HashSet<u32>,
+    ) -> HashMap<u32, PathStep> {
+        if wanted.is_empty() {
+            return HashMap::new();
+        }
+        match self {
+            Self::MmapV4(m) => m
+                .find_unitig_steps(genome_id, wanted)
+                .unwrap_or_default(),
+            other => {
+                let mut out: HashMap<u32, PathStep> = HashMap::with_capacity(wanted.len());
+                if let Some(g) = other.get_path(genome_id) {
+                    for s in &g.steps {
+                        if wanted.contains(&s.unitig_id) {
+                            out.entry(s.unitig_id).or_insert(*s);
+                        }
+                    }
+                }
+                out
+            }
         }
     }
 
@@ -99,7 +175,27 @@ impl PathIndex {
                 let m = m.clone();
                 Box::new((0..n).filter_map(move |gid| m.get_path(gid as u32).ok().flatten()))
             }
+            Self::MmapV4(m) => {
+                let n = m.num_genomes();
+                let m = m.clone();
+                Box::new((0..n).filter_map(move |gid| m.get_path(gid as u32).ok().flatten()))
+            }
         }
+    }
+
+    /// Extract the reference sequence for a genome-offset window using only
+    /// the steps that touch it. On v4 this seeks to the nearest checkpoint
+    /// before `start` and decodes ~the window's worth of steps. On older
+    /// formats it falls back to a full `get_path`-then-filter.
+    pub fn extract_sequence_window(
+        &self,
+        genome_id: u32,
+        start: u64,
+        end: u64,
+        unitigs: &UnitigSet,
+    ) -> Vec<u8> {
+        let steps = self.iter_window(genome_id, start, end);
+        Self::extract_sequence_static(&steps, start, end, unitigs)
     }
 
     /// Extract the reference sequence for a region of a genome by walking its path.
@@ -169,18 +265,18 @@ impl PathIndex {
     /// which feeds WFA a reference full of duplicated regions and produces
     /// nonsense CIGARs full of huge D ops.
     pub fn extract_sequence_static(
-        path: &GenomePath,
+        steps: &[PathStep],
         start: u64,
         end: u64,
         unitigs: &UnitigSet,
     ) -> Vec<u8> {
-        let mut result = Vec::with_capacity((end - start) as usize);
+        let mut result = Vec::with_capacity(end.saturating_sub(start) as usize);
         // Track where in genome coordinates we have already emitted up to,
         // so we can skip duplicated boundary k-mers between consecutive
         // overlapping steps.
         let mut emitted_up_to: Option<u64> = None;
 
-        for step in &path.steps {
+        for step in steps {
             let unitig_len = unitigs.unitigs.get(step.unitig_id as usize)
                 .map(|u| u.sequence.len as u64)
                 .unwrap_or(0);
@@ -435,7 +531,10 @@ pub fn build_path_index(
 ///     first.
 pub fn load_path_index(index_dir: &Path) -> Result<PathIndex> {
     let path_file = index_dir.join("paths.bin");
-    if crate::index::paths_v3::is_v3(&path_file)? {
+    if crate::index::paths_v4::is_v4(&path_file)? {
+        let mmap_idx = crate::index::paths_v4::MmapPathIndexV4::open(&path_file)?;
+        Ok(PathIndex::MmapV4(std::sync::Arc::new(mmap_idx)))
+    } else if crate::index::paths_v3::is_v3(&path_file)? {
         let mmap_idx = crate::index::paths_v3::MmapPathIndexV3::open(&path_file)?;
         Ok(PathIndex::MmapV3(std::sync::Arc::new(mmap_idx)))
     } else if crate::index::paths_v2::is_v2(&path_file)? {

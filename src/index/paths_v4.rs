@@ -502,8 +502,70 @@ impl MmapPathIndexV4 {
         Ok(steps)
     }
 
-    /// Shared decoder used by both `get_path` (start=0, end=MAX) and
-    /// `iter_window`. Returns `(genome_name, genome_length, steps)`.
+    /// Lookup the first PathStep matching each `wanted` unitig_id by walking
+    /// the genome's step stream from the start, with **early-exit** as soon
+    /// as every wanted unitig has been found. For real alignments the seeds
+    /// cluster near one genome region, so this terminates well before the
+    /// full ~650k-step decode that `get_path` performs.
+    ///
+    /// Returns an empty map if `wanted` is empty or the genome is absent.
+    pub fn find_unitig_steps(
+        &self,
+        genome_id: u32,
+        wanted: &std::collections::HashSet<u32>,
+    ) -> Result<HashMap<u32, PathStep>> {
+        let mut found: HashMap<u32, PathStep> = HashMap::with_capacity(wanted.len());
+        if wanted.is_empty() {
+            return Ok(found);
+        }
+        let gid = u64::from(genome_id);
+        if gid >= self.num_genomes {
+            return Ok(found);
+        }
+        let need = wanted.len();
+        self.walk_genome(gid, 0, u64::MAX, |step| {
+            if wanted.contains(&step.unitig_id) {
+                found.entry(step.unitig_id).or_insert(step);
+                if found.len() == need {
+                    return false; // early-exit: all wanted unitigs located
+                }
+            }
+            true
+        })?;
+        Ok(found)
+    }
+
+    /// Read just the genome's name and total length without decoding any
+    /// steps. Useful for direct_align which now anchors via
+    /// [`find_unitig_steps`] + [`iter_window`] and only needs metadata.
+    pub fn genome_meta(&self, genome_id: u32) -> Result<Option<(String, u64)>> {
+        let gid = u64::from(genome_id);
+        if gid >= self.num_genomes {
+            return Ok(None);
+        }
+        let lo = self.genome_offsets[gid as usize] as usize;
+        let hi = self.genome_offsets[gid as usize + 1] as usize;
+        if hi > self.mmap.len() || lo > hi {
+            bail!("corrupt genome offset table for genome {gid}");
+        }
+        let blob = &self.mmap[lo..hi];
+        let mut p = 0usize;
+        let (name_len, np) = read_varint(blob, p)?;
+        p = np;
+        if p + name_len as usize > blob.len() {
+            bail!("genome {gid}: name overruns blob");
+        }
+        let name = std::str::from_utf8(&blob[p..p + name_len as usize])
+            .with_context(|| format!("genome {gid}: name not UTF-8"))?
+            .to_owned();
+        p += name_len as usize;
+        let (genome_length, _np) = read_varint(blob, p)?;
+        Ok(Some((name, genome_length)))
+    }
+
+    /// Shared decoder used by `get_path` (start=0, end=MAX), `iter_window`,
+    /// and (via [`walk_genome`]) `find_unitig_steps`. Returns
+    /// `(genome_name, genome_length, steps)`.
     ///
     /// The checkpoint table embedded in the blob is searched for the entry
     /// with `genome_offset <= start`. Decoding starts from there. For
@@ -515,6 +577,25 @@ impl MmapPathIndexV4 {
         start: u64,
         end: u64,
     ) -> Result<(String, u64, Vec<PathStep>)> {
+        let mut steps: Vec<PathStep> = Vec::new();
+        let (name, genome_length) = self.walk_genome(gid, start, end, |s| {
+            steps.push(s);
+            true
+        })?;
+        Ok((name, genome_length, steps))
+    }
+
+    /// Core walker: from the latest checkpoint at or before `start`, emit
+    /// every step whose `genome_offset < end` via `emit(step) -> bool`.
+    /// Walking stops when `emit` returns false, `step.genome_offset >= end`,
+    /// or the path ends. Returns `(name, genome_length)`.
+    fn walk_genome<F: FnMut(PathStep) -> bool>(
+        &self,
+        gid: u64,
+        start: u64,
+        end: u64,
+        mut emit: F,
+    ) -> Result<(String, u64)> {
         let lo = self.genome_offsets[gid as usize] as usize;
         let hi = self.genome_offsets[gid as usize + 1] as usize;
         if hi > self.mmap.len() || lo > hi {
@@ -543,7 +624,7 @@ impl MmapPathIndexV4 {
         p = np;
 
         if num_steps == 0 {
-            return Ok((name, genome_length, Vec::new()));
+            return Ok((name, genome_length));
         }
         if num_checkpoints == 0 {
             bail!("genome {gid}: non-empty path with zero checkpoints");
@@ -644,14 +725,15 @@ impl MmapPathIndexV4 {
             step_idx = cp.step_idx;
         }
 
-        let mut out: Vec<PathStep> = Vec::new();
-        // Emit the resumed step IF in window.
-        if offset < end {
-            out.push(PathStep {
+        // Emit the resumed step IF in window. Stop if the caller says so.
+        if offset < end
+            && !emit(PathStep {
                 unitig_id: node >> 1,
                 is_reverse: (node & 1) == 1,
                 genome_offset: offset,
-            });
+            })
+        {
+            return Ok((name, genome_length));
         }
         // Walk forward.
         step_idx += 1;
@@ -676,15 +758,17 @@ impl MmapPathIndexV4 {
             if offset >= end {
                 break;
             }
-            out.push(PathStep {
+            if !emit(PathStep {
                 unitig_id: node >> 1,
                 is_reverse: (node & 1) == 1,
                 genome_offset: offset,
-            });
+            }) {
+                return Ok((name, genome_length));
+            }
             step_idx += 1;
         }
 
-        Ok((name, genome_length, out))
+        Ok((name, genome_length))
     }
 }
 
@@ -807,6 +891,67 @@ mod tests {
                 assert_eq!(a.genome_offset, b.genome_offset, "win[{i}] offset");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn find_unitig_steps_returns_first_match_and_exits_early() -> Result<()> {
+        use std::collections::HashSet;
+        let tmp = tempfile::tempdir()?;
+        let p = tmp.path().join("v4f.bin");
+        // Long path so the early-exit path is exercised.
+        let g = make_genome(0, "long", CHECKPOINT_INTERVAL * 3 + 17);
+        write_v4_from_paths(&p, std::slice::from_ref(&g))?;
+        let r = MmapPathIndexV4::open(&p)?;
+
+        // Pick three unitig_ids that DO appear in the path (the make_genome
+        // formula cycles unitig_id = (i*7 + 3) % 97 so we know all of these
+        // will appear) and one that does NOT (unitig 200 > 97).
+        let mut wanted: HashSet<u32> = HashSet::new();
+        wanted.insert(3); // step 0
+        wanted.insert(10); // step 1
+        wanted.insert(17); // step 2
+        let found = r.find_unitig_steps(0, &wanted)?;
+        assert_eq!(found.len(), wanted.len(), "all wanted unitigs found");
+        for &uid in &wanted {
+            let step = found.get(&uid).expect("unitig found");
+            assert_eq!(step.unitig_id, uid);
+            // The match should be the FIRST occurrence in the path.
+            let first = g.steps.iter().find(|s| s.unitig_id == uid).unwrap();
+            assert_eq!(step.genome_offset, first.genome_offset);
+            assert_eq!(step.is_reverse, first.is_reverse);
+        }
+
+        // Absent unitig — find_unitig_steps walks the whole path looking for
+        // it, but never finds it.
+        let mut not_found: HashSet<u32> = HashSet::new();
+        not_found.insert(200);
+        let res = r.find_unitig_steps(0, &not_found)?;
+        assert!(res.is_empty());
+
+        // Empty wanted set returns empty.
+        let res = r.find_unitig_steps(0, &HashSet::new())?;
+        assert!(res.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn genome_meta_reads_without_decoding_steps() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let p = tmp.path().join("v4m.bin");
+        let genomes = vec![
+            make_genome(0, "alpha", 0),
+            make_genome(1, "bravo_long_name", 4096),
+        ];
+        write_v4_from_paths(&p, &genomes)?;
+        let r = MmapPathIndexV4::open(&p)?;
+        let (n0, l0) = r.genome_meta(0)?.unwrap();
+        assert_eq!(n0, "alpha");
+        assert_eq!(l0, genomes[0].genome_length);
+        let (n1, l1) = r.genome_meta(1)?.unwrap();
+        assert_eq!(n1, "bravo_long_name");
+        assert_eq!(l1, genomes[1].genome_length);
+        assert!(r.genome_meta(99)?.is_none());
         Ok(())
     }
 

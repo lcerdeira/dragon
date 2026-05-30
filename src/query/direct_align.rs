@@ -16,7 +16,7 @@
 use lib::alignment_lib::{Alignment, Penalties};
 use lib::wavefront_alignment::wavefront_align;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::index::paths::{PathIndex, PathStep};
 use crate::index::unitig::UnitigSet;
@@ -72,24 +72,17 @@ pub fn direct_align_candidates(
                 log::info!("[direct_align] candidate {}/{} RSS={} MB", i, to_process, mb);
             }
         }
-        let genome_path = match path_index.get_path(hit.genome_id) {
-            Some(p) => p,
+        // Lazy path access (v4): pull just the genome's metadata, then ask
+        // the path index for *only* the steps matching this candidate's
+        // seed unitigs. The old code did a full get_path here (~100 ms on
+        // v3's 60 MB successor table); v4's find_unitig_steps early-exits
+        // once all seeds are located — typically a few ms.
+        let (genome_name, genome_len) = match path_index.genome_meta(hit.genome_id) {
+            Some(m) => m,
             None => continue,
         };
-        let genome_len = genome_path.genome_length;
         if genome_len == 0 {
             continue;
-        }
-
-        // Index this genome's steps by unitig_id once. Seed→step lookup is
-        // then O(1) instead of an O(num_steps) linear scan per seed — on the
-        // saureus shards a genome has ~650K steps and a query carries up to
-        // 64 seeds × 2 strands, so the old `.find()` was ~10^8 iterations
-        // per candidate. First insert wins, matching `.find()`'s semantics.
-        let mut unitig_step: HashMap<u32, &PathStep> =
-            HashMap::with_capacity(genome_path.steps.len());
-        for st in &genome_path.steps {
-            unitig_step.entry(st.unitig_id).or_insert(st);
         }
 
         if hit.seeds.is_empty() {
@@ -105,7 +98,7 @@ pub fn direct_align_candidates(
                 query_start: 0,
                 query_end: query.len(),
                 strand: '+',
-                target_name: genome_path.genome_name.clone(),
+                target_name: genome_name,
                 target_len: genome_len as usize,
                 target_start: 0,
                 target_end: query.len().min(genome_len as usize),
@@ -116,6 +109,10 @@ pub fn direct_align_candidates(
             });
             continue;
         }
+
+        let wanted: HashSet<u32> = hit.seeds.iter().map(|s| s.unitig_id).collect();
+        let unitig_step: HashMap<u32, PathStep> =
+            path_index.find_unitig_steps(hit.genome_id, &wanted);
 
         // Partition seeds by EFFECTIVE strand of the query→genome match,
         // not by seed.is_reverse alone. The effective strand is the XOR
@@ -139,12 +136,14 @@ pub fn direct_align_candidates(
         }
 
         if let Some(record) = align_with_seeds(
-            query, query_name, &fwd_seeds, hit, &genome_path, &unitig_step, unitigs, candidates, false,
+            query, query_name, &fwd_seeds, hit, path_index, hit.genome_id,
+            &genome_name, genome_len, &unitig_step, unitigs, candidates, false,
         ) {
             records.push(record);
         }
         if let Some(record) = align_with_seeds(
-            query, query_name, &rev_seeds, hit, &genome_path, &unitig_step, unitigs, candidates, true,
+            query, query_name, &rev_seeds, hit, path_index, hit.genome_id,
+            &genome_name, genome_len, &unitig_step, unitigs, candidates, true,
         ) {
             records.push(record);
         }
@@ -164,8 +163,11 @@ fn align_with_seeds(
     query_name: &str,
     seeds: &[&crate::index::fm::SeedHit],
     hit: &ContainmentHit,
-    genome_path: &crate::index::paths::GenomePath,
-    unitig_step: &HashMap<u32, &PathStep>,
+    path_index: &PathIndex,
+    genome_id: u32,
+    genome_name: &str,
+    genome_len: u64,
+    unitig_step: &HashMap<u32, PathStep>,
     unitigs: &UnitigSet,
     all_candidates: &[ContainmentHit],
     is_reverse: bool,
@@ -189,7 +191,7 @@ fn align_with_seeds(
     // correct genome anchor coordinates.
     let mut anchors: Vec<(u64, usize, usize)> = Vec::new();
     for seed in seeds {
-        if let Some(&step) = unitig_step.get(&seed.unitig_id) {
+        if let Some(step) = unitig_step.get(&seed.unitig_id) {
             let unitig_len = unitigs
                 .unitigs
                 .get(seed.unitig_id as usize)
@@ -266,12 +268,11 @@ fn align_with_seeds(
     };
     let est_ref_end_for_query = est_ref_start_for_query + l;
     let extract_start = est_ref_start_for_query.saturating_sub(ALIGN_PAD as u64);
-    let extract_end = (est_ref_end_for_query + ALIGN_PAD as u64)
-        .min(genome_path.genome_length);
+    let extract_end = (est_ref_end_for_query + ALIGN_PAD as u64).min(genome_len);
 
     log::debug!(
         "[align_with_seeds] genome={} q_len={} anchors={} ref_min={} ref_max={} extract=[{}, {}) win={}",
-        hit.genome_id,
+        genome_id,
         query.len(),
         anchors.len(),
         ref_min,
@@ -280,8 +281,8 @@ fn align_with_seeds(
         extract_end,
         extract_end.saturating_sub(extract_start),
     );
-    let ref_seq = PathIndex::extract_sequence_static(
-        genome_path,
+    let ref_seq = path_index.extract_sequence_window(
+        genome_id,
         extract_start,
         extract_end,
         unitigs,
@@ -291,7 +292,7 @@ fn align_with_seeds(
     }
     log::debug!(
         "[align_with_seeds] genome={} ref_seq.len()={}",
-        hit.genome_id, ref_seq.len()
+        genome_id, ref_seq.len()
     );
 
     // Hard cap on the alignment text size: never feed WFA more than
@@ -339,8 +340,8 @@ fn align_with_seeds(
         let extra_left = (need / 2) as u64;
         let extra_right = (need - extra_left as usize) as u64;
         let new_start = extract_start.saturating_sub(extra_left);
-        let new_end = (extract_end + extra_right).min(genome_path.genome_length);
-        t = PathIndex::extract_sequence_static(genome_path, new_start, new_end, unitigs);
+        let new_end = (extract_end + extra_right).min(genome_len);
+        t = path_index.extract_sequence_window(genome_id, new_start, new_end, unitigs);
         if q_len > t.len() {
             // Cannot align — query truly longer than the genome region.
             return None;
@@ -425,8 +426,8 @@ fn align_with_seeds(
         query_start: final_q_start,
         query_end: final_q_end,
         strand: if is_reverse { '-' } else { '+' },
-        target_name: genome_path.genome_name.clone(),
-        target_len: genome_path.genome_length as usize,
+        target_name: genome_name.to_string(),
+        target_len: genome_len as usize,
         target_start,
         target_end,
         num_matches,
