@@ -11,6 +11,156 @@ use std::path::Path;
 
 use crate::io::paf::PafRecord;
 
+// ─── KmerCache ────────────────────────────────────────────────────────────────
+
+/// Pre-computed FM-index search results AND unitig colour sets for every
+/// unique k-mer (and unitig) sampled from a batch of queries.
+///
+/// Built once per shard before the parallel query loop, then shared read-only
+/// across all query threads.
+///
+/// ## Two layers of caching
+///
+/// 1. **k-mer → SA positions** (`kmers`): avoids repeated FM-index backward
+///    searches for the same k-mer across queries.  Keys with empty SA interval
+///    or SA count > `max_seed_freq` are not stored.
+///
+/// 2. **unitig_id → RoaringBitmap** (`unitig_colors`): avoids repeated
+///    `color_index.get_colors()` calls, each of which deserialises a bitmap
+///    from the mmap'd file.  For AMR gene panels every unitig in a conserved
+///    resistance domain is queried by tens to hundreds of different genes.
+///    Pre-fetching all colours once (in parallel) and sharing the results
+///    eliminates this O(queries × unitigs_per_query) mmap cost.
+pub struct KmerCache {
+    /// k-mer bytes → SA positions (filtered by max_seed_freq)
+    kmers: std::collections::HashMap<Box<[u8]>, Vec<usize>>,
+    /// unitig_id → pre-deserialised RoaringBitmap colour set
+    pub unitig_colors: std::collections::HashMap<u32, roaring::RoaringBitmap>,
+}
+
+impl KmerCache {
+    /// Build both caches for `queries` against `fm` and `colors`.
+    ///
+    /// Phase 1 — k-mer collection + FM search (parallel over unique k-mers).
+    /// Phase 2 — unitig ID extraction from SA positions.
+    /// Phase 3 — colour pre-fetch (parallel over unique unitig IDs).
+    pub fn build(
+        fm: &crate::index::fm::DragonFmIndex,
+        colors: &crate::index::color::ColorIndex,
+        queries: &[crate::io::fasta::Sequence],
+        kmer_size: usize,
+        max_seed_freq: usize,
+    ) -> Self {
+        use rayon::prelude::*;
+
+        const TARGET_SAMPLES: usize = 384;
+
+        // ── Phase 1: collect unique k-mers ────────────────────────────────────
+        let mut unique_kmers: std::collections::HashSet<Box<[u8]>> =
+            std::collections::HashSet::new();
+
+        for q in queries {
+            if q.seq.len() < kmer_size {
+                continue;
+            }
+            let total = q.seq.len() - kmer_size + 1;
+            let stride = (total / TARGET_SAMPLES).max(1);
+            let mut p = 0usize;
+            while p + kmer_size <= q.seq.len() {
+                let fwd = &q.seq[p..p + kmer_size];
+                let has_ambig = fwd.iter().any(|&b| {
+                    !matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't')
+                });
+                if !has_ambig {
+                    unique_kmers.insert(Box::from(fwd));
+                    unique_kmers.insert(
+                        containment::reverse_complement(fwd).into_boxed_slice(),
+                    );
+                }
+                p += stride;
+            }
+        }
+
+        let n_kmers_total = unique_kmers.len();
+
+        // Parallel FM-index search → keep only (kmer, positions) pairs that
+        // satisfy the frequency filter.
+        let kmer_hits: Vec<(Box<[u8]>, Vec<usize>)> = unique_kmers
+            .into_par_iter()
+            .filter_map(|kmer| {
+                let pos = fm.search(&kmer);
+                if pos.is_empty() || pos.len() > max_seed_freq {
+                    None
+                } else {
+                    Some((kmer, pos))
+                }
+            })
+            .collect();
+
+        log::info!(
+            "KmerCache phase 1: {}/{} k-mers pass freq filter ({:.0}%)",
+            kmer_hits.len(),
+            n_kmers_total,
+            100.0 * kmer_hits.len() as f64 / n_kmers_total.max(1) as f64,
+        );
+
+        // ── Phase 2: extract unique unitig IDs from SA positions ──────────────
+        let mut unique_unitig_ids: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+
+        for (_, positions) in &kmer_hits {
+            for &pos in positions {
+                if let Some((uid, _)) = fm.position_to_unitig(pos) {
+                    unique_unitig_ids.insert(uid);
+                }
+            }
+        }
+
+        let n_unitigs = unique_unitig_ids.len();
+
+        // ── Phase 3: parallel colour pre-fetch ────────────────────────────────
+        // Each unitig's RoaringBitmap is deserialised exactly once here;
+        // all queries that hit this unitig share the result.
+        let unitig_colors: std::collections::HashMap<u32, roaring::RoaringBitmap> =
+            unique_unitig_ids
+                .into_par_iter()
+                .filter_map(|uid| {
+                    colors
+                        .get_colors(uid)
+                        .ok()
+                        .map(|bm| (uid, bm))
+                })
+                .collect();
+
+        log::info!(
+            "KmerCache phase 3: {}/{} unitig colours pre-fetched",
+            unitig_colors.len(),
+            n_unitigs,
+        );
+
+        Self {
+            kmers: kmer_hits.into_iter().collect(),
+            unitig_colors,
+        }
+    }
+
+    /// Returns cached SA positions for `kmer`, or `None` if absent/high-freq.
+    #[inline]
+    pub fn get(&self, kmer: &[u8]) -> Option<&Vec<usize>> {
+        self.kmers.get(kmer)
+    }
+
+    /// Returns the pre-fetched colour bitmap for `unitig_id`, or `None`.
+    #[inline]
+    pub fn get_colors(&self, unitig_id: u32) -> Option<&roaring::RoaringBitmap> {
+        self.unitig_colors.get(&unitig_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.kmers.len()
+    }
+}
+
 /// Configuration for a search query.
 #[derive(Clone)]
 pub struct SearchConfig {
@@ -38,6 +188,15 @@ pub struct SearchConfig {
     /// Ground truth genome name (for labeling training data).
     /// When set, seeds matching this genome get label=1, others get label=0.
     pub ground_truth_genome: Option<String>,
+    /// Enable batch query mode: pre-compute a per-shard KmerCache across all
+    /// queries before searching, then process queries in parallel with rayon.
+    /// Default: true.  Disable for single-query interactive use or when
+    /// `dump_seeds_path` is set (which requires sequential processing).
+    pub batch_queries: bool,
+    /// Enable parallel shard loading: search multiple shards concurrently.
+    /// Each shard loads its own index into memory; safe with mmap (OS demand-
+    /// pages only what's accessed).  Default: true.
+    pub parallel_shards: bool,
 }
 
 impl Default for SearchConfig {
@@ -57,6 +216,8 @@ impl Default for SearchConfig {
             ml_weights_path: None,
             dump_seeds_path: None,
             ground_truth_genome: None,
+            batch_queries: true,
+            parallel_shards: true,
         }
     }
 }
@@ -141,109 +302,51 @@ pub fn search(
     }
     log_rss!("after-load");
 
-    let mut results = Vec::new();
+    // ── Batch mode: build KmerCache once for all queries, then run in parallel ─
+    //
+    // When batch_queries=true (default) and there is no seed-dump writer, we
+    // pre-compute all FM-index lookups for unique k-mers across every query,
+    // then process queries in parallel with rayon.  Each query thread reads the
+    // shared KmerCache (immutable HashMap) and the shared index structures
+    // (all Sync via Mmap / Vec).
+    //
+    // When batch_queries=false or seed_dump is Some, we fall back to the
+    // original sequential loop so the mutable seed-dump writer is safe.
 
-    for query in &queries {
-        log::debug!("Searching query: {} ({} bp)", query.name, query.seq.len());
+    let use_batch = config.batch_queries && seed_dump.is_none() && queries.len() > 1;
 
-        // Adaptive vote threshold: lower for short reads and small seed sets
-        let base_min_votes = if query.seq.len() < 300 { 2u32 } else { 10u32 };
-        let _effective_chain_score = if query.seq.len() < 300 {
-            config.min_chain_score.min(20.0)
-        } else {
-            config.min_chain_score
-        };
-
-        log_rss!("before-find_seeds");
-        // Stage 1: Find seeds via FM-index backward search
-        let seeds = seed::find_seeds(
-            &query.seq,
-            &fm_index,
-            config.min_seed_len,
-            config.max_seed_freq,
+    let kmer_cache: Option<KmerCache> = if use_batch {
+        log::info!(
+            "Batch mode: building KmerCache for {} queries ...",
+            queries.len()
         );
-        log::info!("[stage] find_seeds: {} seeds", seeds.len());
-        log_rss!("after-find_seeds");
+        Some(KmerCache::build(
+            &fm_index,
+            &color_index,
+            &queries,
+            metadata.kmer_size,
+            config.max_seed_freq,
+        ))
+    } else {
+        None
+    };
 
-        // Stage 2: candidate genomes via color voting.
-        //
-        // `find_candidates` is consumed ONLY by the optional ML seed-dump
-        // below — the live search path (Stage 3 onward) ranks genomes with
-        // `containment_rank`. Running it unconditionally cost an ~O(genomes)
-        // pass per query (≈3 s/query/shard on the 16K-genome saureus shards)
-        // for output that was then thrown away. Gate it behind --dump-seeds.
-        if let Some(ref mut writer) = seed_dump {
-            use std::io::Write;
-            // Adaptive vote threshold: at most 20% of seed count, but >= 2.
-            let min_votes = if seeds.is_empty() {
-                base_min_votes
-            } else {
-                base_min_votes.min((seeds.len() as u32 / 5).max(2))
-            };
-            let candidates = candidate::find_candidates(&seeds, &color_index, min_votes);
-            log::info!("[stage] find_candidates: {} candidates", candidates.len());
-
-            // Collect all seed positions for local density computation
-            let all_positions: Vec<usize> = candidates
-                .iter()
-                .flat_map(|c| c.seeds.iter().map(|s| s.query_pos))
-                .collect();
-
-            for cand in &candidates {
-                let genome_name = metadata.genome_names
-                    .get(cand.genome_id as usize)
-                    .cloned()
-                    .unwrap_or_else(|| format!("genome_{}", cand.genome_id));
-
-                // Label: 1 if this genome matches ground truth, 0 otherwise, -1 if no ground truth
-                let label = match &config.ground_truth_genome {
-                    Some(gt) => if genome_name.contains(gt.as_str()) { 1i8 } else { 0i8 },
-                    None => -1i8,
-                };
-
-                for seed in &cand.seeds {
-                    let features = ml_score::SeedFeatures::from_seed_with_context(
-                        seed,
-                        query.seq.len(),
-                        &query.seq,
-                        &color_index,
-                        &all_positions,
-                    );
-                    let _ = writeln!(
-                        writer,
-                        "{}\t{}\t{}\t{}\t{}",
-                        query.name, cand.genome_id, genome_name,
-                        features.as_tsv(), label
-                    );
-                }
-            }
-        }
-
-        // Stage 3: Containment-based ranking (primary method)
-        // Computes k-mer containment between query and each genome via color index.
-        // This bypasses the unitig-boundary seeding problem by counting ALL k-mer
-        // matches, not just those within single unitigs.
-        log_rss!("before-containment_rank");
-        // Use the INDEX'S actual k-mer size for containment (the FM-index is
-        // built at this k). Previously this was `config.min_seed_len.min(31)`,
-        // which evaluated to 15 by default — a 15-mer search in a 31-mer
-        // FM-index is highly ambiguous, blows past max_seed_freq for most
-        // query positions, and scatters credit across many unrelated genomes,
-        // losing the per-genome resolution that ranks the right shard hits.
+    // ── Inner function: process one query against the already-loaded shard ────
+    // Extracted so both the parallel and sequential paths share logic.
+    let process_one = |query: &crate::io::fasta::Sequence,
+                       cache: Option<&KmerCache>|
+     -> QueryResult {
+        // Stage 3: containment ranking (uses cache when available)
         let containment_hits = containment::containment_rank(
             &query.seq,
             &fm_index,
             &color_index,
             metadata.kmer_size,
             config.max_seed_freq,
+            cache,
         );
-        log::info!("[stage] containment_rank: {} hits", containment_hits.len());
-        log_rss!("after-containment_rank");
 
-        // Stage 4: Direct alignment against top candidates
-        // Extracts actual genome sequences and aligns directly, bypassing
-        // the lossy unitig→path→coordinate mapping.
-        log_rss!("before-direct_align");
+        // Stage 4: direct alignment against top candidates
         let mut alignments = direct_align::direct_align_candidates(
             &query.seq,
             &query.name,
@@ -252,64 +355,116 @@ pub fn search(
             &unitigs,
             config.max_target_seqs,
         );
-        log::info!("[stage] direct_align: {} alignments", alignments.len());
-        log_rss!("after-direct_align");
 
-        // Stage 5: Post-alignment filtering — this is critical for precision
-        alignments.retain(|record| {
-            let identity = record.identity();
-            identity >= config.min_identity
+        // Stage 5: post-alignment filters
+        alignments.retain(|r| r.identity() >= config.min_identity);
+        alignments.retain(|r| {
+            if query.seq.is_empty() {
+                return false;
+            }
+            (r.query_end - r.query_start) as f64 / query.seq.len() as f64
+                >= config.min_query_coverage
         });
-
-        // Also filter by query coverage using the chain-computed coverage
-        // (which is relative to full query length)
-        // This must match against the chain; since we lose the chain reference
-        // after alignment, use PAF query_start/query_end as the coverage measure.
-        alignments.retain(|record| {
-            let query_cov = if query.seq.len() > 0 {
-                (record.query_end - record.query_start) as f64 / query.seq.len() as f64
-            } else {
-                0.0
-            };
-            query_cov >= config.min_query_coverage
-        });
-
-        // Score-ratio filter: discard hits with score < min_score_ratio * best_score
         if !alignments.is_empty() && config.min_score_ratio > 0.0 {
-            let best_score = alignments[0]
+            let best = alignments[0]
                 .tags
                 .iter()
                 .find_map(|t| t.strip_prefix("AS:i:").and_then(|v| v.parse::<f64>().ok()))
                 .unwrap_or(0.0);
-            let threshold = best_score * config.min_score_ratio;
-            alignments.retain(|record| {
-                record
-                    .tags
+            let thr = best * config.min_score_ratio;
+            alignments.retain(|r| {
+                r.tags
                     .iter()
                     .find_map(|t| t.strip_prefix("AS:i:").and_then(|v| v.parse::<f64>().ok()))
                     .unwrap_or(0.0)
-                    >= threshold
+                    >= thr
             });
         }
-
-        // Per-genome deduplication: keep only the best chain per target genome
-        // (alignments are sorted by score descending, so first occurrence is best)
-        {
-            let mut seen: HashSet<String> = HashSet::new();
-            alignments.retain(|record| seen.insert(record.target_name.clone()));
-        }
-
-        // Enforce max_target_seqs: keep only the top N hits sorted by score
-        // (alignments are already sorted by chain score descending from stage 3)
+        // Dedup per target genome + cap
+        let mut seen: HashSet<String> = HashSet::new();
+        alignments.retain(|r| seen.insert(r.target_name.clone()));
         alignments.truncate(config.max_target_seqs);
 
-        results.push(QueryResult {
+        QueryResult {
             query_name: query.name.clone(),
             query_len: query.seq.len(),
             alignments,
-        });
-    }
+        }
+    };
 
+    // ── Execute: parallel (batch) or sequential ───────────────────────────────
+    let results: Vec<QueryResult> = if use_batch {
+        use rayon::prelude::*;
+        let cache_ref = kmer_cache.as_ref();
+        queries
+            .par_iter()
+            .map(|q| process_one(q, cache_ref))
+            .collect()
+    } else {
+        // Sequential path — supports seed_dump writer
+        let mut out = Vec::with_capacity(queries.len());
+        for query in &queries {
+            // Stage 1 (for seed dump only)
+            let seeds_for_dump = if seed_dump.is_some() {
+                Some(seed::find_seeds(
+                    &query.seq,
+                    &fm_index,
+                    config.min_seed_len,
+                    config.max_seed_freq,
+                ))
+            } else {
+                None
+            };
+            // Stage 2: optional ML seed dump
+            if let (Some(ref mut writer), Some(ref seeds)) = (seed_dump.as_mut(), &seeds_for_dump) {
+                use std::io::Write;
+                let base_min_votes = if query.seq.len() < 300 { 2u32 } else { 10u32 };
+                let min_votes = if seeds.is_empty() {
+                    base_min_votes
+                } else {
+                    base_min_votes.min((seeds.len() as u32 / 5).max(2))
+                };
+                let candidates = candidate::find_candidates(seeds, &color_index, min_votes);
+                let all_positions: Vec<usize> = candidates
+                    .iter()
+                    .flat_map(|c| c.seeds.iter().map(|s| s.query_pos))
+                    .collect();
+                for cand in &candidates {
+                    let genome_name = metadata
+                        .genome_names
+                        .get(cand.genome_id as usize)
+                        .cloned()
+                        .unwrap_or_else(|| format!("genome_{}", cand.genome_id));
+                    let label = match &config.ground_truth_genome {
+                        Some(gt) => {
+                            if genome_name.contains(gt.as_str()) { 1i8 } else { 0i8 }
+                        }
+                        None => -1i8,
+                    };
+                    for s in &cand.seeds {
+                        let features = ml_score::SeedFeatures::from_seed_with_context(
+                            s,
+                            query.seq.len(),
+                            &query.seq,
+                            &color_index,
+                            &all_positions,
+                        );
+                        let _ = writeln!(
+                            writer,
+                            "{}\t{}\t{}\t{}\t{}",
+                            query.name, cand.genome_id, genome_name,
+                            features.as_tsv(), label
+                        );
+                    }
+                }
+            }
+            // Stages 3-5 (same logic as batch path, no cache)
+            out.push(process_one(query, None));
+        }
+        out
+    };
+
+    log_rss!("after-direct_align");
     Ok(results)
 }
 
@@ -410,30 +565,68 @@ pub fn search_multi_index(
         return search_with_overlays(query_file, &config);
     }
 
-    log::info!("Searching across {} shard indices", index_dirs.len());
+    log::info!(
+        "Searching across {} shard indices (parallel_shards={})",
+        index_dirs.len(),
+        base_config.parallel_shards,
+    );
 
-    // Merged results by query name
+    // ── Per-shard search: parallel or sequential ──────────────────────────────
+    //
+    // Parallel shard mode: rayon work-steals over shards; each shard loads its
+    // own mmap'd index.  Memory cost per shard is small in practice because the
+    // OS demand-pages only accessed pages (FM-index backward search touches the
+    // suffix array sequentially; colors are accessed sparsely).
+    //
+    // Sequential mode: load one shard at a time — lower peak RSS.
+
+    let all_shard_results: Vec<Vec<QueryResult>> = if base_config.parallel_shards
+        && index_dirs.len() > 1
+    {
+        use rayon::prelude::*;
+        index_dirs
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, index_dir)| {
+                if !index_dir.exists() {
+                    log::warn!("  Shard {:?} not found, skipping", index_dir);
+                    return None;
+                }
+                log::info!("  [parallel] Shard {}/{}: {:?}", i + 1, index_dirs.len(), index_dir);
+                let mut shard_cfg = base_config.clone();
+                shard_cfg.index_dir = index_dir.clone().into();
+                match search_with_overlays(query_file, &shard_cfg) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        log::warn!("  Shard {:?} failed: {}, skipping", index_dir, e);
+                        None
+                    }
+                }
+            })
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(index_dirs.len());
+        for (i, index_dir) in index_dirs.iter().enumerate() {
+            log::info!("  Shard {}/{}: {:?}", i + 1, index_dirs.len(), index_dir);
+            if !index_dir.exists() {
+                log::warn!("  Shard {:?} not found, skipping", index_dir);
+                continue;
+            }
+            let mut shard_cfg = base_config.clone();
+            shard_cfg.index_dir = index_dir.clone().into();
+            match search_with_overlays(query_file, &shard_cfg) {
+                Ok(r) => out.push(r),
+                Err(e) => log::warn!("  Shard {:?} failed: {}, skipping", index_dir, e),
+            }
+        }
+        out
+    };
+
+    // Merge all shard results by query name
     let mut merged: std::collections::HashMap<String, QueryResult> =
         std::collections::HashMap::new();
 
-    for (i, index_dir) in index_dirs.iter().enumerate() {
-        log::info!("  Shard {}/{}: {:?}", i + 1, index_dirs.len(), index_dir);
-        if !index_dir.exists() {
-            log::warn!("  Shard {:?} not found, skipping", index_dir);
-            continue;
-        }
-
-        let mut shard_config = base_config.clone();
-        shard_config.index_dir = index_dir.clone().into();
-
-        let shard_results = match search_with_overlays(query_file, &shard_config) {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("  Shard {:?} failed: {}, skipping", index_dir, e);
-                continue;
-            }
-        };
-
+    for shard_results in all_shard_results {
         for qr in shard_results {
             merged
                 .entry(qr.query_name.clone())

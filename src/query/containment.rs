@@ -17,6 +17,7 @@ use roaring::RoaringBitmap;
 
 use crate::index::color::ColorIndex;
 use crate::index::fm::{DragonFmIndex, SeedHit};
+use crate::query::KmerCache;
 
 /// A genome ranked by k-mer containment.
 #[derive(Clone, Debug)]
@@ -42,12 +43,17 @@ pub struct ContainmentHit {
 /// 3. For each matching unitig, look up genome membership via color index
 /// 4. Accumulate per-genome k-mer counts
 /// 5. Rank by containment = shared_kmers / total_query_kmers
+/// Main entry point — uses a pre-built `KmerCache` when available, otherwise
+/// falls back to live FM-index lookups.  The cache is built once per shard
+/// across all queries and shared read-only, so this function is `Sync`-safe
+/// for parallel query processing.
 pub fn containment_rank(
     query: &[u8],
     fm_index: &DragonFmIndex,
     color_index: &ColorIndex,
     kmer_size: usize,
     max_seed_freq: usize,
+    kmer_cache: Option<&KmerCache>,
 ) -> Vec<ContainmentHit> {
     if query.len() < kmer_size {
         return Vec::new();
@@ -95,14 +101,22 @@ pub fn containment_rank(
             // forward hit marks the position before the reverse one).
             let rc = reverse_complement(fwd);
             for (kmer, is_reverse) in [(fwd.to_vec(), false), (rc, true)] {
-                let positions = fm_index.search(&kmer);
-                if positions.is_empty() || positions.len() > max_seed_freq {
-                    continue;
-                }
+                // Use pre-computed cache when available; fall back to live search.
+                let positions: std::borrow::Cow<Vec<usize>> = match kmer_cache {
+                    Some(cache) => match cache.get(&kmer) {
+                        Some(cached) => std::borrow::Cow::Borrowed(cached),
+                        None => continue, // cache miss means absent or too frequent
+                    },
+                    None => {
+                        let p = fm_index.search(&kmer);
+                        if p.is_empty() || p.len() > max_seed_freq { continue; }
+                        std::borrow::Cow::Owned(p)
+                    }
+                };
                 let mut seen = RoaringBitmap::new();
                 let mut unitigs: Vec<u32> = Vec::new();
                 let mut seeds: Vec<SeedHit> = Vec::new();
-                for &pos in &positions {
+                for &pos in positions.as_ref() {
                     if let Some((unitig_id, offset)) = fm_index.position_to_unitig(pos) {
                         if seen.insert(unitig_id) {
                             unitigs.push(unitig_id);
@@ -115,6 +129,15 @@ pub fn containment_rank(
                                 sa_count: positions.len(),
                             });
                             unitig_colors.entry(unitig_id).or_insert_with(|| {
+                                // Use pre-fetched cache when available (avoids
+                                // mmap deserialisation per unitig per query).
+                                // Fall back to live color_index lookup for any
+                                // unitig that wasn't in the pre-fetch set.
+                                if let Some(cache) = kmer_cache {
+                                    if let Some(bm) = cache.get_colors(unitig_id) {
+                                        return bm.clone();
+                                    }
+                                }
                                 color_index.get_colors(unitig_id).unwrap_or_default()
                             });
                         }
@@ -231,7 +254,7 @@ pub fn containment_rank(
     hits
 }
 
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
+pub(crate) fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter()
         .rev()
         .map(|&b| match b {

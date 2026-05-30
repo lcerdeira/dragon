@@ -92,7 +92,8 @@ enum Commands {
         #[arg(long, default_value = "50")]
         min_chain_score: f64,
 
-        /// Maximum number of target genomes to report per query
+        /// Maximum number of target genomes to report per query.
+        /// Set to 0 for no cap (report all hits above identity/coverage threshold).
         #[arg(long, default_value = "10")]
         max_target_seqs: usize,
 
@@ -107,6 +108,22 @@ enum Commands {
         /// Minimum score ratio: only keep hits with score >= ratio * best_score (0.0-1.0)
         #[arg(long, default_value = "0.1")]
         min_score_ratio: f64,
+
+        /// Search preset. Options:
+        ///   default    — balanced defaults (max-target-seqs 10, identity ≥ 0.7)
+        ///   amr        — AMR gene surveillance: no target cap, identity ≥ 0.9, coverage ≥ 0.8,
+        ///                batch KmerCache + parallel shards enabled
+        ///   fast       — containment-only pre-filter, lower identity threshold (0.5)
+        #[arg(long, default_value = "default")]
+        preset: String,
+
+        /// Disable batch-query mode (process queries one at a time; required for --dump-seeds)
+        #[arg(long)]
+        no_batch: bool,
+
+        /// Disable parallel shard loading (load shards one at a time; lower peak RAM)
+        #[arg(long)]
+        no_parallel_shards: bool,
 
         /// Hardware profile: laptop (≤8 GB, conservative) or workstation (full resources)
         #[arg(long, default_value = "workstation")]
@@ -422,6 +439,9 @@ fn main() -> Result<()> {
             min_identity,
             min_query_coverage,
             min_score_ratio,
+            preset,
+            no_batch,
+            no_parallel_shards,
             profile,
             gfa_radius,
             no_ml,
@@ -440,21 +460,63 @@ fn main() -> Result<()> {
                 _ => (max_ram, threads),
             };
 
+            // Apply preset overrides on top of explicit CLI flags.
+            // Preset values are defaults; explicit flags take precedence.
+            let (
+                eff_max_target_seqs,
+                eff_min_identity,
+                eff_min_query_coverage,
+                eff_batch,
+                eff_parallel_shards,
+            ) = match preset.as_str() {
+                "amr" => {
+                    // AMR surveillance: high recall (many hits per gene) but bounded.
+                    // usize::MAX caused direct_align to run WFA against all 30K+
+                    // genomes for mecA etc., taking hours.  1000 per gene gives full
+                    // database coverage for most AMR genes while keeping runtime sane.
+                    log::info!(
+                        "Preset amr: max-target-seqs 1000, identity ≥ 0.9, \
+                         coverage ≥ 0.8, batch+parallel shards enabled"
+                    );
+                    (
+                        if max_target_seqs == 10 { 1_000 } else { max_target_seqs },
+                        if (min_identity - 0.7).abs() < 1e-9 { 0.9 } else { min_identity },
+                        if (min_query_coverage - 0.3).abs() < 1e-9 { 0.8 } else { min_query_coverage },
+                        !no_batch,
+                        !no_parallel_shards,
+                    )
+                }
+                "fast" => {
+                    log::info!("Preset fast: identity ≥ 0.5, batch+parallel enabled");
+                    (
+                        max_target_seqs,
+                        if (min_identity - 0.7).abs() < 1e-9 { 0.5 } else { min_identity },
+                        min_query_coverage,
+                        !no_batch,
+                        !no_parallel_shards,
+                    )
+                }
+                _ => (max_target_seqs, min_identity, min_query_coverage, !no_batch, !no_parallel_shards),
+            };
+
             let config = dragon::query::SearchConfig {
                 index_dir: index.clone().into(),
                 min_seed_len,
                 max_seed_freq,
                 min_chain_score,
-                max_target_seqs,
+                // 0 means "no cap" — map to usize::MAX so truncate() is a no-op
+                max_target_seqs: if eff_max_target_seqs == 0 { usize::MAX } else { eff_max_target_seqs },
                 threads: effective_threads,
                 max_ram_gb: effective_ram,
-                min_identity,
-                min_query_coverage,
+                min_identity: eff_min_identity,
+                min_query_coverage: eff_min_query_coverage,
                 min_score_ratio,
                 no_ml,
                 ml_weights_path: ml_weights,
                 dump_seeds_path: dump_seeds,
                 ground_truth_genome: ground_truth,
+                batch_queries: eff_batch,
+                parallel_shards: eff_parallel_shards,
             };
 
             let results = if shard.is_empty() {

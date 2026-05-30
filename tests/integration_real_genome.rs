@@ -84,6 +84,8 @@ fn real_genome_self_slice_aligns_perfectly() {
         ml_weights_path: None,
         dump_seeds_path: None,
         ground_truth_genome: None,
+        batch_queries: true,
+        parallel_shards: false, // single shard in tests
     };
     let results = search(&q_path, &config).expect("search");
     assert_eq!(results.len(), 1);

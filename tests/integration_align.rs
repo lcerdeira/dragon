@@ -149,6 +149,8 @@ fn run_search(idx_dir: &Path, query_path: &Path) -> Vec<dragon::query::QueryResu
         ml_weights_path: None,
         dump_seeds_path: None,
         ground_truth_genome: None,
+        batch_queries: true,
+        parallel_shards: false, // single shard in tests
     };
     search(query_path, &config).expect("search")
 }
