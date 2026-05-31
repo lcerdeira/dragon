@@ -43,6 +43,10 @@ pub struct KmerCache {
     pub unitig_colors: std::collections::HashMap<u32, roaring::RoaringBitmap>,
     /// IDF weight per unitig: log(N_genomes / cardinality). Higher = more discriminative.
     pub unitig_idf: std::collections::HashMap<u32, f32>,
+    /// Combined centrality score per unitig: IDF(u) × ln(1 + degree(u)).
+    /// Higher = rarer AND at more structural junctions = most discriminative.
+    /// Empty when PathIndex is not v4 (degree not available).
+    pub unitig_centrality: std::collections::HashMap<u32, f32>,
 }
 
 impl KmerCache {
@@ -51,9 +55,12 @@ impl KmerCache {
     /// Phase 1 — k-mer collection + FM search (parallel over unique k-mers).
     /// Phase 2 — unitig ID extraction from SA positions.
     /// Phase 3 — colour pre-fetch (parallel over unique unitig IDs).
+    /// Phase 4 — IDF weight computation.
+    /// Phase 5 — graph centrality scores (IDF × ln(1 + degree)).
     pub fn build(
         fm: &crate::index::fm::DragonFmIndex,
         colors: &crate::index::color::ColorIndex,
+        path_index: &crate::index::paths::PathIndex,   // NEW parameter
         queries: &[crate::io::fasta::Sequence],
         kmer_size: usize,
         max_seed_freq: usize,
@@ -159,10 +166,29 @@ impl KmerCache {
             .collect();
         log::info!("KmerCache phase 4: IDF computed for {} unitigs", unitig_idf.len());
 
+        // ── Phase 5: graph centrality scores ─────────────────────────────────────
+        // centrality(u) = IDF(u) × ln(1 + degree(u))
+        // degree(u) = number of distinct successors in cDBG CSR table (paths.bin v4)
+        // Unitigs at structural junctions AND rare → most discriminative for search.
+        let unitig_centrality: std::collections::HashMap<u32, f32> = unitig_idf
+            .iter()
+            .map(|(&uid, &idf)| {
+                let degree = path_index.unitig_successor_degree(uid);
+                let centrality = idf * (1.0_f64 + degree as f64).ln() as f32;
+                (uid, centrality.max(0.0))
+            })
+            .collect();
+        let n_with_centrality = unitig_centrality.values().filter(|&&c| c > 0.0).count();
+        log::info!(
+            "KmerCache phase 5: centrality computed for {} unitigs ({} non-zero)",
+            unitig_centrality.len(), n_with_centrality
+        );
+
         Self {
             kmers: kmer_hits.into_iter().collect(),
             unitig_colors,
             unitig_idf,
+            unitig_centrality,
         }
     }
 
@@ -182,6 +208,15 @@ impl KmerCache {
     #[inline]
     pub fn get_idf(&self, unitig_id: u32) -> f32 {
         self.unitig_idf.get(&unitig_id).copied().unwrap_or(0.0)
+    }
+
+    /// Returns centrality score for `unitig_id`, falling back to IDF if centrality unavailable.
+    #[inline]
+    pub fn get_centrality(&self, unitig_id: u32) -> f32 {
+        self.unitig_centrality
+            .get(&unitig_id)
+            .copied()
+            .unwrap_or_else(|| self.get_idf(unitig_id))
     }
 
     pub fn len(&self) -> usize {
@@ -351,6 +386,7 @@ pub fn search(
         Some(KmerCache::build(
             &fm_index,
             &color_index,
+            &path_index,    // NEW
             &queries,
             metadata.kmer_size,
             config.max_seed_freq,

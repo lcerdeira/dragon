@@ -159,6 +159,14 @@ impl PathIndex {
         }
     }
 
+    /// Return the CSR successor degree for unitig `uid`, or 0 if unavailable.
+    pub fn unitig_successor_degree(&self, unitig_id: u32) -> u32 {
+        match self {
+            PathIndex::MmapV4(idx) => idx.unitig_successor_degree(unitig_id),
+            _ => 0, // not available for v2/v3/Eager
+        }
+    }
+
     /// Iterate every genome path. Yields owned values; the mmap variant
     /// decodes lazily and is suitable even for huge indices because each
     /// item is dropped before the next is decoded.

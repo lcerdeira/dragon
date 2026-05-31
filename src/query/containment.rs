@@ -259,8 +259,8 @@ pub fn containment_rank(
         .iter()
         .map(|(uid, c)| {
             let weight = if let Some(cache) = kmer_cache {
-                let idf = cache.get_idf(*uid) as f64;
-                // Negate so sort_by ascending puts highest-IDF first.
+                let idf = cache.get_centrality(*uid) as f64;
+                // Negate so sort_by ascending puts highest-centrality first.
                 if idf > 0.0 { -idf } else { c.len() as f64 }
             } else {
                 c.len() as f64

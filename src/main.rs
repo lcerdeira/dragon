@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -1369,12 +1369,14 @@ echo "  Download complete."
         }
 
         Commands::SearchZarr { zarr, query, output } => {
-            log::info!("Searching Zarr store {:?}", zarr);
-            let fm = dragon::index::zarr_backend::ZarrFmIndex::open(&zarr)?;
-            let colors = dragon::index::zarr_backend::ZarrColorIndex::open(&zarr)?;
+            // Dispatch on URL scheme: http(s):// → lazy HTTP reader; else filesystem.
+            let zarr_str = zarr.to_string_lossy();
+            let is_http = zarr_str.starts_with("http://") || zarr_str.starts_with("https://");
+
             log::info!(
-                "Opened index: {} unitigs, {} genomes, k={}, {} text bytes",
-                fm.num_unitigs, fm.num_genomes, fm.kmer_size, fm.text_len
+                "Searching Zarr store {:?} ({})",
+                zarr,
+                if is_http { "HTTP lazy" } else { "filesystem" }
             );
 
             let records = dragon::io::fasta::read_sequences(&query)?;
@@ -1386,18 +1388,50 @@ echo "  Download complete."
             use std::io::Write as _;
             writeln!(writer, "query\thits\tunitig_id\toffset\tgenomes")?;
 
-            for rec in records {
-                let positions = fm.search(&rec.seq)?;
-                let n = positions.len();
-                if n == 0 {
-                    writeln!(writer, "{}\t0\t\t\t", rec.name)?;
-                    continue;
+            if is_http {
+                // ── Cloud mode: fetch only the chunks we need via HTTP ─────
+                let idx = dragon::index::zarr_http::HttpZarrIndex::open(&zarr_str)
+                    .context("open HTTP Zarr index")?;
+                log::info!(
+                    "HTTP Zarr: {} unitigs, {} genomes, k={}, SA={} entries",
+                    idx.num_unitigs, idx.num_genomes, idx.kmer_size, idx.sa_len
+                );
+                for rec in records {
+                    let positions = idx.search(&rec.seq)?;
+                    let n = positions.len();
+                    if n == 0 {
+                        writeln!(writer, "{}\t0\t\t\t", rec.name)?;
+                        continue;
+                    }
+                    for pos in positions.iter().take(64) {
+                        if let Some((uid, off)) = idx.position_to_unitig(*pos) {
+                            let bm = idx.get_colors(uid)?;
+                            let genomes: Vec<String> = bm.iter().map(|g: u32| g.to_string()).collect();
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}", rec.name, n, uid, off, genomes.join(","))?;
+                        }
+                    }
                 }
-                for pos in positions.iter().take(64) {
-                    if let Some((uid, off)) = fm.position_to_unitig(*pos) {
-                        let bm = colors.get_colors(uid)?;
-                        let genomes: Vec<String> = bm.iter().map(|g| g.to_string()).collect();
-                        writeln!(writer, "{}\t{}\t{}\t{}\t{}", rec.name, n, uid, off, genomes.join(","))?;
+            } else {
+                // ── Local mode: use the existing FilesystemStore reader ────
+                let fm = dragon::index::zarr_backend::ZarrFmIndex::open(&zarr)?;
+                let colors = dragon::index::zarr_backend::ZarrColorIndex::open(&zarr)?;
+                log::info!(
+                    "Filesystem Zarr: {} unitigs, {} genomes, k={}, {} text bytes",
+                    fm.num_unitigs, fm.num_genomes, fm.kmer_size, fm.text_len
+                );
+                for rec in records {
+                    let positions = fm.search(&rec.seq)?;
+                    let n = positions.len();
+                    if n == 0 {
+                        writeln!(writer, "{}\t0\t\t\t", rec.name)?;
+                        continue;
+                    }
+                    for pos in positions.iter().take(64) {
+                        if let Some((uid, off)) = fm.position_to_unitig(*pos) {
+                            let bm = colors.get_colors(uid)?;
+                            let genomes: Vec<String> = bm.iter().map(|g| g.to_string()).collect();
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}", rec.name, n, uid, off, genomes.join(","))?;
+                        }
                     }
                 }
             }

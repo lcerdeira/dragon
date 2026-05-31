@@ -469,6 +469,20 @@ impl MmapPathIndexV4 {
         self.num_genomes
     }
 
+    /// Return the number of distinct successors of unitig `uid` in the shared
+    /// CSR successor table.  O(1): reads two entries from succ_offsets.
+    /// Returns 0 if `uid` is out of range or the v4 index has no successor table.
+    pub fn unitig_successor_degree(&self, unitig_id: u32) -> u32 {
+        let uid = unitig_id as usize;
+        let n_unitigs = self.succ_offsets.len().saturating_sub(1);
+        if uid >= n_unitigs {
+            return 0;
+        }
+        let lo = self.succ_offsets[uid];
+        let hi = self.succ_offsets[uid + 1];
+        hi.saturating_sub(lo) as u32
+    }
+
     /// Decode the entire genome path. Provided for compatibility; for hot
     /// paths use [`iter_window`].
     pub fn get_path(&self, genome_id: u32) -> Result<Option<GenomePath>> {
