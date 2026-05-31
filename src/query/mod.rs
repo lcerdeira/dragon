@@ -1,4 +1,5 @@
 pub mod adaptive_kmer;
+pub mod bayes;
 pub mod candidate;
 pub mod chain;
 pub mod containment;

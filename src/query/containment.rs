@@ -18,6 +18,7 @@ use roaring::RoaringBitmap;
 use crate::index::color::ColorIndex;
 use crate::index::fm::{DragonFmIndex, SeedHit};
 use crate::query::KmerCache;
+use crate::query::bayes::{bayesian_probs, bayesian_ani};
 use crate::query::spaced_seed::{AnchorConfig, pigeonhole_search};
 use crate::query::sprt::{SprtDecision, SprtState};
 
@@ -33,6 +34,14 @@ pub struct ContainmentHit {
     pub total_query_kmers: usize,
     /// Information-weighted score (sum of IC for matched unitigs).
     pub info_score: f64,
+    /// Bayesian posterior P(true containment ≥ 0.5 | observed hits).
+    /// Calibrated probability: accounts for sample size, unlike raw containment.
+    pub bayes_prob: Option<f64>,
+    /// High-confidence Bayesian P(true containment ≥ 0.9 | observed hits).
+    /// For clinical/epidemiological applications requiring strong evidence.
+    pub bayes_prob_hc: Option<f64>,
+    /// Bayesian ANI estimate (posterior mean, Laplace-smoothed).
+    pub bayes_ani: Option<f64>,
     /// Seeds that map to this genome (for optional chaining/alignment).
     pub seeds: Vec<SeedHit>,
 }
@@ -321,20 +330,32 @@ pub fn containment_rank(
     // Build ranked results
     let mut hits: Vec<ContainmentHit> = genome_shared
         .into_iter()
-        .map(|(genome_id, shared)| ContainmentHit {
-            genome_id,
-            // containment estimated over the sampled k-mers
-            containment: shared as f64 / n_sampled.max(1) as f64,
-            shared_kmers: shared,
-            total_query_kmers: n_sampled,
-            info_score: genome_info.get(&genome_id).copied().unwrap_or(0.0),
-            seeds: genome_seeds.remove(&genome_id).unwrap_or_default(),
+        .map(|(genome_id, shared)| {
+            let containment = shared as f64 / n_sampled.max(1) as f64;
+            let (bp, bp_hc) = bayesian_probs(shared, n_sampled);
+            let bani = bayesian_ani(shared, n_sampled, kmer_size);
+            ContainmentHit {
+                genome_id,
+                containment,
+                shared_kmers: shared,
+                total_query_kmers: n_sampled,
+                info_score: genome_info.get(&genome_id).copied().unwrap_or(0.0),
+                bayes_prob: bp,
+                bayes_prob_hc: bp_hc,
+                bayes_ani: bani,
+                seeds: genome_seeds.remove(&genome_id).unwrap_or_default(),
+            }
         })
         .collect();
 
-    // Sort by containment descending, break ties by info_score
+    // Sort by Bayesian posterior P(match) descending, break ties by info_score.
+    // Bayesian prob is preferred over raw containment because it accounts for
+    // sample size: short reads (fewer sampled k-mers) get appropriately wider
+    // posteriors, preventing overconfident ranking of uncertain containment scores.
     hits.sort_by(|a, b| {
-        b.containment.partial_cmp(&a.containment)
+        let a_score = a.bayes_prob.unwrap_or(a.containment);
+        let b_score = b.bayes_prob.unwrap_or(b.containment);
+        b_score.partial_cmp(&a_score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.info_score.partial_cmp(&a.info_score)
                 .unwrap_or(std::cmp::Ordering::Equal))

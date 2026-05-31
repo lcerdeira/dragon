@@ -658,11 +658,26 @@ fn estimate_mapq(hit: &ContainmentHit, all_candidates: &[ContainmentHit]) -> u8 
 
 fn containment_tags(hit: &ContainmentHit, query_len: usize) -> Vec<String> {
     let as_score = (hit.containment * query_len as f64) as usize;
-    vec![
+    let mut tags = vec![
         format!("AS:i:{}", as_score),
         format!("ct:f:{:.4}", hit.containment),
         format!("ic:f:{:.1}", hit.info_score),
-    ]
+    ];
+    // Bayesian posterior probability tags — statistically calibrated scores.
+    // bp: P(true containment ≥ 0.5 | observed hits, N sampled)
+    // bq: P(true containment ≥ 0.9 | observed hits, N sampled) — high-conf
+    // ba: Bayesian ANI estimate (Laplace-smoothed posterior mean)
+    if let Some(bp) = hit.bayes_prob {
+        tags.push(format!("bp:f:{:.4}", bp));
+    }
+    if let Some(bq) = hit.bayes_prob_hc {
+        tags.push(format!("bq:f:{:.4}", bq));
+    }
+    if let Some(ba) = hit.bayes_ani {
+        tags.push(format!("ba:f:{:.4}", ba));
+    }
+    tags.push(format!("n_eff:i:{}", hit.total_query_kmers));
+    tags
 }
 
 fn extract_as_tag(record: &PafRecord) -> f64 {
