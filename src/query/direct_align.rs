@@ -281,6 +281,94 @@ fn align_with_seeds(
         extract_end,
         extract_end.saturating_sub(extract_start),
     );
+
+    // ── Graph-aware alignment (v4 PathIndex only) ────────────────────────────
+    // For v4 indices, attempt a graph-anchored DP alignment before falling
+    // through to WFA.  This uses the subgraph structure (anchor unitigs →
+    // graph positions) to drive extraction rather than raw coordinate math.
+    if crate::query::graph_align::should_use_graph_align(path_index) {
+        let anchor_ids: Vec<u32> = seeds.iter().map(|s| s.unitig_id).collect();
+        if let Some(subgraph) = crate::query::graph_align::extract_query_subgraph(
+            path_index,
+            unitigs,
+            genome_id,
+            genome_len,
+            &anchor_ids,
+            query.len(),
+        ) {
+            // Orient the query the same way as WFA would.
+            let query_oriented: Vec<u8> = if is_reverse {
+                reverse_complement(query)
+            } else {
+                query.to_vec()
+            };
+
+            let max_edit = (query.len() as f64 * 0.15) as usize + 5;
+            if let Some(ga) = crate::query::graph_align::graph_dp_align(
+                &query_oriented,
+                &subgraph,
+                max_edit,
+            ) {
+                // ── Build PafRecord from GraphAlignment ──────────────────────
+                let identity = if ga.alignment_len == 0 {
+                    0.0
+                } else {
+                    ga.num_matches as f64 / ga.alignment_len as f64
+                };
+
+                let target_start = subgraph.window_start as usize;
+                let target_end = target_start + ga.ref_consumed;
+
+                // Map query consumed back to original (un-RC'd) coordinates.
+                let (final_q_start, final_q_end) = if is_reverse {
+                    let l = query_oriented.len();
+                    // Traceback starts from (q_len, best_j) so query_consumed
+                    // counts from position 0 of the oriented query.
+                    let a = 0usize;
+                    let b = ga.query_consumed;
+                    let rc_start = l.saturating_sub(b);
+                    let rc_end = l.saturating_sub(a);
+                    (rc_start, rc_end)
+                } else {
+                    (0, ga.query_consumed)
+                };
+
+                let mut tags = containment_tags(hit, query.len());
+                tags.push(format!("NM:i:{}", ga.edit_distance));
+                tags.push(format!("de:f:{:.4}", 1.0 - identity));
+                tags.push(format!("cg:Z:{}", ga.cigar));
+                tags.push("tp:A:G".to_string()); // tag: aligned via graph DP
+
+                log::debug!(
+                    "[graph_align] genome={} edit={} identity={:.4} cigar={}",
+                    genome_id, ga.edit_distance, identity, &ga.cigar,
+                );
+
+                return Some(PafRecord {
+                    query_name: query_name.to_string(),
+                    query_len: query.len(),
+                    query_start: final_q_start,
+                    query_end: final_q_end,
+                    strand: if is_reverse { '-' } else { '+' },
+                    target_name: genome_name.to_string(),
+                    target_len: genome_len as usize,
+                    target_start,
+                    target_end,
+                    num_matches: ga.num_matches,
+                    alignment_len: ga.alignment_len,
+                    mapq: estimate_mapq(hit, all_candidates),
+                    tags,
+                });
+            }
+            // Graph DP failed or exceeded max_edit — fall through to WFA.
+            log::debug!(
+                "[graph_align] genome={} graph DP failed (max_edit={}), falling through to WFA",
+                genome_id, max_edit,
+            );
+        }
+    }
+    // ── End graph-aware alignment ────────────────────────────────────────────
+
     let ref_seq = path_index.extract_sequence_window(
         genome_id,
         extract_start,

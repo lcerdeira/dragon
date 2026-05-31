@@ -18,6 +18,8 @@ use roaring::RoaringBitmap;
 use crate::index::color::ColorIndex;
 use crate::index::fm::{DragonFmIndex, SeedHit};
 use crate::query::KmerCache;
+use crate::query::spaced_seed::{AnchorConfig, pigeonhole_search};
+use crate::query::sprt::{SprtDecision, SprtState};
 
 /// A genome ranked by k-mer containment.
 #[derive(Clone, Debug)]
@@ -89,6 +91,13 @@ pub fn containment_rank(
     let mut unitig_colors: HashMap<u32, RoaringBitmap> = HashMap::new();
     let mut n_sampled = 0usize;
 
+    // SPRT: one state per containment_rank call — tests whether ANY k-mer hit
+    // is observed (query-level: "does this query appear in ANY genome?").
+    let mut sprt = SprtState::default_for_kmer31();
+    // Set once we have accepted H₁; we continue processing normally but skip
+    // further SPRT updates since the decision is already made.
+    let mut sprt_accepted_h1 = false;
+
     let mut p = 0usize;
     while p + kmer_size <= query.len() {
         n_sampled += 1;
@@ -97,9 +106,18 @@ pub fn containment_rank(
             .iter()
             .any(|&b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'));
         if !has_ambig {
+            // SPRT: treat any k-mer hit (on either strand) as a hit observation.
+            // This is a query-level test — does the query appear in ANY genome?
+            // We use a single hit/miss per query position (forward strand only,
+            // to avoid double-counting the same position).
+
             // Search the k-mer on both strands (forward first, so the
             // forward hit marks the position before the reverse one).
             let rc = reverse_complement(fwd);
+            // SPRT counts a hit if EITHER strand has a match at this position.
+            // Using forward-only would miss queries that are entirely on the
+            // reverse complement strand (e.g. reverse_strand_perfect_match test).
+            let mut position_hit = false;
             for (kmer, is_reverse) in [(fwd.to_vec(), false), (rc, true)] {
                 // Use pre-computed cache when available; fall back to live search.
                 let positions: std::borrow::Cow<Vec<usize>> = match kmer_cache {
@@ -113,6 +131,10 @@ pub fn containment_rank(
                         std::borrow::Cow::Owned(p)
                     }
                 };
+                // Record a hit for SPRT if EITHER strand matched.
+                if !positions.is_empty() {
+                    position_hit = true;
+                }
                 let mut seen = RoaringBitmap::new();
                 let mut unitigs: Vec<u32> = Vec::new();
                 let mut seeds: Vec<SeedHit> = Vec::new();
@@ -147,6 +169,62 @@ pub fn containment_rank(
                     kmer_hits.push(KmerHit { qpos: p, is_reverse, unitigs, seeds });
                 }
             }
+            // Update SPRT once per query position using the forward-strand result.
+            if !sprt_accepted_h1 {
+                match sprt.update(position_hit) {
+                    SprtDecision::AcceptH0 => return Vec::new(),
+                    SprtDecision::AcceptH1 => sprt_accepted_h1 = true,
+                    SprtDecision::Continue => {}
+                }
+            }
+
+            // ---- Pigeonhole fallback: if no hit from solid k-mer, try multi-anchor.
+            //
+            // Activated ONLY when the query is short (≤300bp) OR the adaptive k
+            // already dropped below the index k=31.  For long queries at k=31,
+            // the solid-hit miss rate is acceptable and anchor hits (k=10) would
+            // introduce low-specificity evidence that degrades candidate ranking.
+            // Short queries need anchors because their solid seeds are few and
+            // the pigeonhole gain is highest (P(≥1/3 exact | d=5%) ≈ 0.94).
+            let use_pigeonhole = !position_hit && kmer_size >= 20
+                && (query.len() <= 300 || kmer_size < 31);
+            if use_pigeonhole {
+                let anchor_cfg = AnchorConfig::default();
+                let window = &query[p..p.saturating_add(kmer_size).min(query.len())];
+                if window.len() >= anchor_cfg.min_window() {
+                    let (_, anchor_hits) = pigeonhole_search(
+                        query, p, kmer_size, fm_index, max_seed_freq, &anchor_cfg,
+                    );
+                    if !anchor_hits.is_empty() {
+                        // Collect unique unitig IDs from anchor hits
+                        let mut seen = RoaringBitmap::new();
+                        let mut unitigs: Vec<u32> = Vec::new();
+                        let mut seeds: Vec<SeedHit> = Vec::new();
+                        for hit in &anchor_hits {
+                            if seen.insert(hit.unitig_id) {
+                                unitigs.push(hit.unitig_id);
+                                seeds.push(hit.clone());
+                                unitig_colors.entry(hit.unitig_id).or_insert_with(|| {
+                                    if let Some(cache) = kmer_cache {
+                                        if let Some(bm) = cache.get_colors(hit.unitig_id) {
+                                            return bm.clone();
+                                        }
+                                    }
+                                    color_index.get_colors(hit.unitig_id).unwrap_or_default()
+                                });
+                            }
+                        }
+                        if !unitigs.is_empty() {
+                            kmer_hits.push(KmerHit {
+                                qpos: p,
+                                is_reverse: false,
+                                unitigs,
+                                seeds,
+                            });
+                        }
+                    }
+                }
+            }
         }
         p += stride;
     }
@@ -166,14 +244,25 @@ pub fn containment_rank(
     // genome — and any genome that genuinely contains the query — shares the
     // query's most specific k-mers, so it is always captured. ----
     const CANDIDATE_TARGET: u64 = 2000;
-    let mut by_card: Vec<(u32, u64)> = unitig_colors
+    // When a KmerCache is available, sort by IDF descending (most discriminative first).
+    // Otherwise sort by cardinality ascending (rarest first) — same logic as before.
+    let mut by_weight: Vec<(u32, f64)> = unitig_colors
         .iter()
-        .map(|(uid, c)| (*uid, c.len()))
+        .map(|(uid, c)| {
+            let weight = if let Some(cache) = kmer_cache {
+                let idf = cache.get_idf(*uid) as f64;
+                // Negate so sort_by ascending puts highest-IDF first.
+                if idf > 0.0 { -idf } else { c.len() as f64 }
+            } else {
+                c.len() as f64
+            };
+            (*uid, weight)
+        })
         .collect();
-    by_card.sort_by_key(|&(_, card)| card);
+    by_weight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut candidate_set = RoaringBitmap::new();
-    for (uid, _card) in &by_card {
+    for (uid, _) in &by_weight {
         if candidate_set.len() >= CANDIDATE_TARGET {
             break;
         }
@@ -267,6 +356,24 @@ pub(crate) fn reverse_complement(seq: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Compute ANI 95% CI half-width using the delta method (Blanca et al. 2022).
+pub fn ani_confidence_interval(
+    shared_kmers: usize,
+    total_kmers: usize,
+    kmer_size: usize,
+) -> Option<f64> {
+    if total_kmers == 0 || kmer_size == 0 { return None; }
+    let c = shared_kmers as f64 / total_kmers as f64;
+    if c <= 0.0 { return None; }
+    let ani = c.powf(1.0 / kmer_size as f64);
+    if ani <= 0.0 { return None; }
+    let var_c = c * (1.0 - c) / total_kmers as f64;
+    let deriv = kmer_size as f64 * ani.powi(kmer_size as i32 - 1);
+    if deriv <= f64::EPSILON { return None; }
+    let var_ani = var_c / (deriv * deriv);
+    Some((1.96 * var_ani.sqrt()).min(0.5)) // cap at 0.5 to avoid nonsensical values
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +383,50 @@ mod tests {
         assert_eq!(reverse_complement(b"ACGT"), b"ACGT");
         assert_eq!(reverse_complement(b"AAAA"), b"TTTT");
         assert_eq!(reverse_complement(b"ACGTACGT"), b"ACGTACGT");
+    }
+
+    #[test]
+    fn ani_ci_zero_total_returns_none() {
+        assert!(ani_confidence_interval(0, 0, 31).is_none());
+    }
+
+    #[test]
+    fn ani_ci_zero_kmer_size_returns_none() {
+        assert!(ani_confidence_interval(10, 100, 0).is_none());
+    }
+
+    #[test]
+    fn ani_ci_zero_shared_returns_none() {
+        // c = 0.0 → None
+        assert!(ani_confidence_interval(0, 100, 31).is_none());
+    }
+
+    #[test]
+    fn ani_ci_perfect_containment_small_ci() {
+        // 1000/1000 shared k-mers of size 31 → ANI ≈ 1.0, CI should be very small
+        let ci = ani_confidence_interval(1000, 1000, 31);
+        // c=1.0 → var_c = 0 → CI = 0
+        assert!(ci.is_some());
+        assert!(ci.unwrap() < 1e-6, "Expected near-zero CI for perfect containment");
+    }
+
+    #[test]
+    fn ani_ci_realistic_value() {
+        // ~53% containment (ANI≈0.98, k=31), 384 sampled k-mers
+        let shared = (0.533 * 384.0) as usize;
+        let ci = ani_confidence_interval(shared, 384, 31);
+        assert!(ci.is_some());
+        let ci_val = ci.unwrap();
+        // CI should be finite, positive, and well below 0.5
+        assert!(ci_val > 0.0 && ci_val < 0.5,
+            "Unexpected CI value: {}", ci_val);
+    }
+
+    #[test]
+    fn ani_ci_capped_at_half() {
+        // Very few k-mers → large variance → cap kicks in
+        let ci = ani_confidence_interval(1, 2, 31);
+        assert!(ci.is_some());
+        assert!(ci.unwrap() <= 0.5, "CI must be capped at 0.5");
     }
 }

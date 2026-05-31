@@ -24,35 +24,53 @@ pub struct SeedHit {
 
 /// The FM-index wrapper for Dragon.
 pub struct DragonFmIndex {
-    /// The serialized FM-index data (memory mapped or loaded).
-    /// In a full implementation, this would be an actual fm_index::RLFMIndex.
-    /// For now, we use a simplified suffix array approach.
+    /// Concatenated unitig text (with separator bytes between unitigs).
     pub text: Vec<u8>,
+    /// Suffix array in **linear** (sorted) order — always present.
+    /// Used for range collection after bounds are found.
     pub suffix_array: Vec<usize>,
+    /// Suffix array in **Eytzinger (BFS) order** — present when built with
+    /// `--sa-layout eytzinger`.  Empty for linearly-built indexes.
+    ///
+    /// The Eytzinger layout places binary-search pivot elements near the start
+    /// of the array, so the first ~20 levels of any search fit in L2 cache
+    /// regardless of total SA size.  This eliminates the dominant cost of
+    /// large-index searches: cache misses during the O(log n) bounds computation.
+    ///
+    /// Layout (1-indexed): node 1 = root (SA[n/2]), left child = 2k,
+    /// right child = 2k+1.  Element at `eytzinger_sa[k]` is the SA value
+    /// (text position) that would sit at node k in the implicit search tree.
+    pub eytzinger_sa: Vec<usize>,
     pub cumulative_lengths: CumulativeLengthIndex,
 }
 
 impl DragonFmIndex {
+    /// Returns true if this index uses the Eytzinger cache-oblivious SA layout.
+    #[inline]
+    pub fn has_eytzinger(&self) -> bool {
+        !self.eytzinger_sa.is_empty()
+    }
+
     /// Backward search: find all occurrences of pattern in the indexed text.
-    /// Returns positions in the concatenated text.
+    ///
+    /// Uses the Eytzinger SA for bounds computation when available (cache-
+    /// oblivious, eliminates random cache misses on large indexes), then
+    /// collects positions from the linear SA sequentially.
     pub fn search(&self, pattern: &[u8]) -> Vec<usize> {
-        // Simple binary search on suffix array for correctness.
-        // Production would use FM-index backward search for O(m) time.
-        let mut results = Vec::new();
-
         if pattern.is_empty() || self.text.is_empty() {
-            return results;
+            return Vec::new();
         }
 
-        // Find the range of suffixes that start with `pattern`
-        let lo = self.lower_bound(pattern);
-        let hi = self.upper_bound(pattern);
+        let (lo, hi) = if self.has_eytzinger() {
+            (
+                self.lower_bound_eytzinger(pattern),
+                self.upper_bound_eytzinger(pattern),
+            )
+        } else {
+            (self.lower_bound(pattern), self.upper_bound(pattern))
+        };
 
-        for i in lo..hi {
-            results.push(self.suffix_array[i]);
-        }
-
-        results
+        self.suffix_array[lo..hi].to_vec()
     }
 
     /// Count occurrences of pattern (without locating).
@@ -121,6 +139,108 @@ impl DragonFmIndex {
         }
         lo
     }
+
+    // ── Eytzinger (BFS-ordered) binary search ─────────────────────────────────
+
+    /// Lower-bound search in the Eytzinger-ordered SA.
+    ///
+    /// Traverses the implicit binary search tree in BFS order: the root is at
+    /// index 1, left child of node k is 2k, right child is 2k+1 (1-indexed).
+    ///
+    /// After the tree walk, extracts the final linear sorted index from the
+    /// last visited node to return the conventional lower-bound position in
+    /// `self.suffix_array`.
+    fn lower_bound_eytzinger(&self, pattern: &[u8]) -> usize {
+        let n = self.suffix_array.len();
+        let eytz = &self.eytzinger_sa; // 1-indexed, eytz[0] unused, eytz[1..=n] valid
+
+        // Walk the Eytzinger tree
+        let mut k = 1usize; // 1-indexed node
+        while k <= n {
+            let sa_pos = eytz[k];
+            let suffix_end = self.text.len().min(sa_pos + pattern.len());
+            let suffix = &self.text[sa_pos..suffix_end];
+            if suffix < pattern {
+                k = 2 * k + 1; // go right
+            } else {
+                k = 2 * k;     // go left
+            }
+        }
+        // Convert from Eytzinger node back to linear sorted index.
+        // Node k (after loop) represents a missing element; the lower-bound
+        // is the node we last went left from, encoded as k >> 1's right-spine.
+        // Standard Eytzinger lower-bound recovery:
+        eytzinger_node_to_sorted_idx(k, n)
+    }
+
+    /// Upper-bound search in the Eytzinger-ordered SA.
+    fn upper_bound_eytzinger(&self, pattern: &[u8]) -> usize {
+        let n = self.suffix_array.len();
+        let eytz = &self.eytzinger_sa;
+
+        let mut k = 1usize;
+        while k <= n {
+            let sa_pos = eytz[k];
+            let suffix_end = self.text.len().min(sa_pos + pattern.len());
+            let suffix = &self.text[sa_pos..suffix_end];
+            if suffix <= pattern {
+                k = 2 * k + 1; // go right
+            } else {
+                k = 2 * k;     // go left
+            }
+        }
+        eytzinger_node_to_sorted_idx(k, n)
+    }
+}
+
+/// Convert an Eytzinger leaf node index back to a linear sorted array index.
+///
+/// After a complete tree walk in Eytzinger order, the final node `k` encodes
+/// the position where the search "fell off" the tree.  By counting trailing
+/// right-child steps (trailing 1-bits after shifting right) we recover the
+/// sorted index.
+///
+/// This is the standard O(1) recovery used in cache-oblivious binary search
+/// implementations (Brodal, Fagerberg, and Pedersen 2003).
+#[inline]
+fn eytzinger_node_to_sorted_idx(mut k: usize, n: usize) -> usize {
+    // k is the first out-of-bounds node.  The sorted index is the number of
+    // times we went left on the way down, which equals the number of trailing
+    // zeros in the node index after accounting for the direction encoding.
+    let trailing = (k + 1).trailing_zeros() as usize;
+    let result = (k >> trailing) - 1;
+    result.min(n)
+}
+
+// ── Eytzinger SA builder (used at index-build time) ─────────────────────────
+
+/// Build an Eytzinger-ordered copy of a suffix array.
+///
+/// The Eytzinger layout (BFS order of the implicit binary search tree) ensures
+/// that the first log₂(cache_size/8) ≈ 20+ levels of any search are served from
+/// cache, eliminating the random-miss cost that dominates searches in large SAs.
+///
+/// Returns `eytzinger_sa` where:
+/// * `eytzinger_sa[0]` is unused (1-indexed layout)
+/// * `eytzinger_sa[k]` = the SA value at node k in the BFS tree
+pub fn build_eytzinger_sa(sa: &[usize]) -> Vec<usize> {
+    let n = sa.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut eytz = vec![0usize; n + 1]; // 1-indexed
+    fill_eytzinger(sa, &mut eytz, 1, 0, n);
+    eytz
+}
+
+fn fill_eytzinger(sa: &[usize], eytz: &mut Vec<usize>, node: usize, lo: usize, hi: usize) {
+    if lo >= hi || node >= eytz.len() {
+        return;
+    }
+    let mid = lo + (hi - lo) / 2;
+    eytz[node] = sa[mid];
+    fill_eytzinger(sa, eytz, 2 * node, lo, mid);
+    fill_eytzinger(sa, eytz, 2 * node + 1, mid + 1, hi);
 }
 
 /// Build the FM-index from a UnitigSet.
@@ -132,10 +252,28 @@ pub fn build_fm_index(unitigs: &UnitigSet, output_dir: &Path) -> Result<()> {
 }
 
 /// Build the FM-index with an optional RAM budget for suffix array construction.
-pub fn build_fm_index_with_ram(unitigs: &UnitigSet, output_dir: &Path, max_ram_bytes: Option<usize>) -> Result<()> {
+///
+/// Set `use_eytzinger = true` to also build the Eytzinger-ordered SA for
+/// cache-oblivious binary search (recommended for indexes > 1 GB).
+pub fn build_fm_index_with_ram(
+    unitigs: &UnitigSet,
+    output_dir: &Path,
+    max_ram_bytes: Option<usize>,
+) -> Result<()> {
+    build_fm_index_with_options(unitigs, output_dir, max_ram_bytes, false)
+}
+
+/// Full build entry point with all options.
+pub fn build_fm_index_with_options(
+    unitigs: &UnitigSet,
+    output_dir: &Path,
+    max_ram_bytes: Option<usize>,
+    use_eytzinger: bool,
+) -> Result<()> {
     log::info!(
-        "Building FM-index over {} bases of concatenated unitig text",
-        unitigs.concatenated.len()
+        "Building FM-index over {} bases of concatenated unitig text (eytzinger={})",
+        unitigs.concatenated.len(),
+        use_eytzinger,
     );
 
     let text = unitigs.concatenated.clone();
@@ -144,8 +282,17 @@ pub fn build_fm_index_with_ram(unitigs: &UnitigSet, output_dir: &Path, max_ram_b
         log::info!("Using external-memory SA construction (RAM budget: {} MB)", ram_budget / 1_048_576);
         build_suffix_array_external(&text, output_dir, ram_budget)?
     } else {
-        // In-memory suffix array construction
         build_suffix_array(&text)
+    };
+
+    // Optionally build Eytzinger layout for cache-oblivious search.
+    let eytzinger_sa = if use_eytzinger {
+        log::info!("Building Eytzinger SA layout ({} entries)", suffix_array.len());
+        let e = build_eytzinger_sa(&suffix_array);
+        log::info!("Eytzinger SA built ({:.1} MB additional)", e.len() * 8 / 1_048_576);
+        e
+    } else {
+        Vec::new()
     };
 
     // Build cumulative length index
@@ -155,6 +302,7 @@ pub fn build_fm_index_with_ram(unitigs: &UnitigSet, output_dir: &Path, max_ram_b
     let index = DragonFmIndex {
         text,
         suffix_array,
+        eytzinger_sa,
         cumulative_lengths: cum_lengths,
     };
 
@@ -167,10 +315,40 @@ pub fn build_fm_index_with_ram(unitigs: &UnitigSet, output_dir: &Path, max_ram_b
 }
 
 /// Load the FM-index from disk.
+///
+/// Supports both the current format (includes `eytzinger_sa`) and the legacy
+/// format (without it).  bincode is positional, so old files end before
+/// the `eytzinger_sa` bytes; we detect this by trying the new format first
+/// and falling back to the legacy struct on failure.
 pub fn load_fm_index(index_dir: &Path) -> Result<DragonFmIndex> {
+    use anyhow::Context as _;
+
     let fm_path = index_dir.join("fm_index.bin");
-    let serialized: FmIndexSerializable = crate::util::mmap::read_bincode(&fm_path)?;
-    Ok(serialized.to_index())
+    let bytes = std::fs::read(&fm_path)
+        .with_context(|| format!("reading FM-index from {:?}", fm_path))?;
+
+    // Try current format (with eytzinger_sa).
+    if let Ok(s) = bincode::deserialize::<FmIndexSerializable>(&bytes) {
+        return Ok(s.to_index());
+    }
+
+    // Fall back to legacy format (no eytzinger_sa field).
+    #[derive(serde::Deserialize)]
+    struct FmIndexLegacy {
+        text: Vec<u8>,
+        suffix_array: Vec<usize>,
+        cumulative_lengths: CumulativeLengthIndex,
+    }
+    let legacy = bincode::deserialize::<FmIndexLegacy>(&bytes)
+        .with_context(|| format!("deserializing FM-index from {:?}", fm_path))?;
+
+    log::debug!("Loaded FM-index in legacy format from {:?}", fm_path);
+    Ok(DragonFmIndex {
+        text: legacy.text,
+        suffix_array: legacy.suffix_array,
+        eytzinger_sa: Vec::new(),
+        cumulative_lengths: legacy.cumulative_lengths,
+    })
 }
 
 /// Serializable representation of the FM-index.
@@ -179,6 +357,9 @@ struct FmIndexSerializable {
     text: Vec<u8>,
     suffix_array: Vec<usize>,
     cumulative_lengths: CumulativeLengthIndex,
+    /// Eytzinger-ordered SA for cache-oblivious search.  Empty = use linear SA.
+    #[serde(default)]
+    eytzinger_sa: Vec<usize>,
 }
 
 impl FmIndexSerializable {
@@ -187,6 +368,7 @@ impl FmIndexSerializable {
             text: index.text.clone(),
             suffix_array: index.suffix_array.clone(),
             cumulative_lengths: index.cumulative_lengths.clone(),
+            eytzinger_sa: index.eytzinger_sa.clone(),
         }
     }
 
@@ -195,6 +377,7 @@ impl FmIndexSerializable {
             text: self.text,
             suffix_array: self.suffix_array,
             cumulative_lengths: self.cumulative_lengths,
+            eytzinger_sa: self.eytzinger_sa,
         }
     }
 }
@@ -371,6 +554,7 @@ mod tests {
             text,
             suffix_array: sa,
             cumulative_lengths: cum,
+            eytzinger_sa: Vec::new(),
         };
 
         // Search for ACGT - should find 2 occurrences
@@ -408,6 +592,7 @@ mod tests {
             text,
             suffix_array: sa,
             cumulative_lengths: cum,
+            eytzinger_sa: Vec::new(),
         };
 
         let (len, count) = index.variable_length_search(b"ACGTACGTX");

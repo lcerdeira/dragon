@@ -537,6 +537,7 @@ mod tests {
         let fm = DragonFmIndex {
             text: vec![0, 1, 2, 3],
             suffix_array: vec![0, 1, 2, 3],
+            eytzinger_sa: Vec::new(),
             cumulative_lengths: crate::ds::elias_fano::CumulativeLengthIndex::from_lengths(&[4]),
         };
         let metadata = SignalIndexMetadata {

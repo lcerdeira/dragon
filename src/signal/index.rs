@@ -173,6 +173,7 @@ pub fn build_signal_index(
     let fm_index = DragonFmIndex {
         text: concatenated,
         suffix_array,
+        eytzinger_sa: Vec::new(),
         cumulative_lengths: cum_lengths,
     };
 
@@ -292,6 +293,7 @@ impl SignalFmIndexSerializable {
         DragonFmIndex {
             text: self.text,
             suffix_array: self.suffix_array,
+            eytzinger_sa: Vec::new(),
             cumulative_lengths: self.cumulative_lengths,
         }
     }

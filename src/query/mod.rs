@@ -1,9 +1,13 @@
+pub mod adaptive_kmer;
 pub mod candidate;
 pub mod chain;
 pub mod containment;
 pub mod direct_align;
+pub mod graph_align;
 pub mod ml_score;
 pub mod seed;
+pub mod spaced_seed;
+pub mod sprt;
 
 use anyhow::Result;
 use std::collections::HashSet;
@@ -36,6 +40,8 @@ pub struct KmerCache {
     kmers: std::collections::HashMap<Box<[u8]>, Vec<usize>>,
     /// unitig_id → pre-deserialised RoaringBitmap colour set
     pub unitig_colors: std::collections::HashMap<u32, roaring::RoaringBitmap>,
+    /// IDF weight per unitig: log(N_genomes / cardinality). Higher = more discriminative.
+    pub unitig_idf: std::collections::HashMap<u32, f32>,
 }
 
 impl KmerCache {
@@ -138,9 +144,24 @@ impl KmerCache {
             n_unitigs,
         );
 
+        // ── Phase 4: compute IDF weights ─────────────────────────────────────
+        // IDF(u) = ln(N_genomes / cardinality(u)) — higher means rarer = more discriminative.
+        // N_genomes from the color index (already loaded).
+        let n_genomes = colors.num_genomes() as f64;
+        let unitig_idf: std::collections::HashMap<u32, f32> = unitig_colors
+            .iter()
+            .map(|(&uid, bm)| {
+                let card = bm.len().max(1) as f64;
+                let idf = (n_genomes / card).ln() as f32;
+                (uid, idf.max(0.0))
+            })
+            .collect();
+        log::info!("KmerCache phase 4: IDF computed for {} unitigs", unitig_idf.len());
+
         Self {
             kmers: kmer_hits.into_iter().collect(),
             unitig_colors,
+            unitig_idf,
         }
     }
 
@@ -154,6 +175,12 @@ impl KmerCache {
     #[inline]
     pub fn get_colors(&self, unitig_id: u32) -> Option<&roaring::RoaringBitmap> {
         self.unitig_colors.get(&unitig_id)
+    }
+
+    /// Returns the IDF weight for `unitig_id`, or 0.0 if absent.
+    #[inline]
+    pub fn get_idf(&self, unitig_id: u32) -> f32 {
+        self.unitig_idf.get(&unitig_id).copied().unwrap_or(0.0)
     }
 
     pub fn len(&self) -> usize {
@@ -336,15 +363,55 @@ pub fn search(
     let process_one = |query: &crate::io::fasta::Sequence,
                        cache: Option<&KmerCache>|
      -> QueryResult {
-        // Stage 3: containment ranking (uses cache when available)
-        let containment_hits = containment::containment_rank(
-            &query.seq,
-            &fm_index,
-            &color_index,
-            metadata.kmer_size,
-            config.max_seed_freq,
-            cache,
-        );
+        // Stage 3: containment ranking with adaptive k-mer size.
+        //
+        // Dragon's FM-index is built at k=31, but fixed k=31 gives
+        // P(exact seed) = (1-d)^31 ≈ 0.20 at d=5% divergence — too low for
+        // reliable candidate identification.  We select the largest k such
+        // that E[exact seeds] ≥ 50 at assumed 5% divergence, then run a
+        // multi-k fallback if initial containment finds no candidates.
+        let primary_k = adaptive_kmer::adaptive_k(query.seq.len(), metadata.kmer_size);
+
+        let containment_hits = {
+            // First attempt at primary (adaptive) k.
+            let hits = containment::containment_rank(
+                &query.seq,
+                &fm_index,
+                &color_index,
+                primary_k,
+                config.max_seed_freq,
+                cache,
+            );
+
+            if !hits.is_empty() {
+                hits
+            } else {
+                // Multi-k fallback: try progressively smaller k values.
+                // Each step increases expected seeds by ~sensitivity_gain(k, k-4).
+                let fallback_ks = adaptive_kmer::fallback_k_sequence(primary_k);
+                let mut best = Vec::new();
+                for &k in fallback_ks.iter().skip(1) { // skip primary_k (already tried)
+                    let gain = adaptive_kmer::sensitivity_gain(primary_k, k);
+                    log::debug!(
+                        "containment fallback k={} (primary={}, gain={:.1}×)",
+                        k, primary_k, gain
+                    );
+                    let h = containment::containment_rank(
+                        &query.seq,
+                        &fm_index,
+                        &color_index,
+                        k,
+                        config.max_seed_freq,
+                        None, // cache built for primary_k; smaller k needs live lookups
+                    );
+                    if !h.is_empty() {
+                        best = h;
+                        break;
+                    }
+                }
+                best
+            }
+        };
 
         // Stage 4: direct alignment against top candidates
         let mut alignments = direct_align::direct_align_candidates(
