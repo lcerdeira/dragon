@@ -68,3 +68,4 @@ aws/
 
 # Test fixtures (regenerable, large binary indexes)
 tests/data/
+cleanup_bak.sh

@@ -92,6 +92,22 @@ impl Default for AnchorConfig {
 }
 
 impl AnchorConfig {
+    /// Config optimised for cross-species queries (15-30% divergence).
+    ///
+    /// 5 anchors of k=7: P(≥1 exact | d=15%) = 0.855, P(≥1 | d=20%) = 0.692.
+    /// This enables detection of homologs at 70-85% ANI which solid k=31
+    /// completely misses (P ≈ 0.006 at 15% divergence).
+    pub fn for_cross_species() -> Self {
+        Self { k_anchor: 7, n_anchors: 5, min_anchor_votes: 1 }
+    }
+
+    /// Config for within-species / short-read mode (default).
+    pub fn for_short_reads() -> Self {
+        Self::default()
+    }
+}
+
+impl AnchorConfig {
     /// Minimum window size needed to fit all anchors with this config.
     pub fn min_window(&self) -> usize {
         // anchors packed end-to-end: n_anchors * k_anchor

@@ -65,6 +65,7 @@ pub fn containment_rank(
     kmer_size: usize,
     max_seed_freq: usize,
     kmer_cache: Option<&KmerCache>,
+    cross_species: bool,
 ) -> Vec<ContainmentHit> {
     if query.len() < kmer_size {
         return Vec::new();
@@ -102,7 +103,13 @@ pub fn containment_rank(
 
     // SPRT: one state per containment_rank call — tests whether ANY k-mer hit
     // is observed (query-level: "does this query appear in ANY genome?").
-    let mut sprt = SprtState::default_for_kmer31();
+    // Cross-species mode uses the fast (higher error) variant to avoid
+    // early rejection when hit rates are low (15-30% divergence).
+    let mut sprt = if cross_species {
+        SprtState::fast_for_kmer31()   // higher α/β = less conservative
+    } else {
+        SprtState::default_for_kmer31()
+    };
     // Set once we have accepted H₁; we continue processing normally but skip
     // further SPRT updates since the decision is already made.
     let mut sprt_accepted_h1 = false;
@@ -195,10 +202,16 @@ pub fn containment_rank(
             // introduce low-specificity evidence that degrades candidate ranking.
             // Short queries need anchors because their solid seeds are few and
             // the pigeonhole gain is highest (P(≥1/3 exact | d=5%) ≈ 0.94).
-            let use_pigeonhole = !position_hit && kmer_size >= 20
-                && (query.len() <= 300 || kmer_size < 31);
+            // Pigeonhole activates for: short reads (≤300bp), reduced k, OR cross-species mode.
+            // Cross-species uses k=7 anchors (5×) for 15-30% divergence sensitivity.
+            let use_pigeonhole = !position_hit && kmer_size >= 7
+                && (query.len() <= 300 || kmer_size < 31 || cross_species);
             if use_pigeonhole {
-                let anchor_cfg = AnchorConfig::default();
+                let anchor_cfg = if cross_species {
+                    crate::query::spaced_seed::AnchorConfig::for_cross_species()
+                } else {
+                    AnchorConfig::default()
+                };
                 let window = &query[p..p.saturating_add(kmer_size).min(query.len())];
                 if window.len() >= anchor_cfg.min_window() {
                     let (_, anchor_hits) = pigeonhole_search(

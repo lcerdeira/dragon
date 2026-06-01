@@ -110,10 +110,12 @@ enum Commands {
         min_score_ratio: f64,
 
         /// Search preset. Options:
-        ///   default    — balanced defaults (max-target-seqs 10, identity ≥ 0.7)
-        ///   amr        — AMR gene surveillance: no target cap, identity ≥ 0.9, coverage ≥ 0.8,
-        ///                batch KmerCache + parallel shards enabled
-        ///   fast       — containment-only pre-filter, lower identity threshold (0.5)
+        ///   default        — balanced defaults (max-target-seqs 10, identity ≥ 0.7)
+        ///   amr            — AMR gene surveillance: max-target-seqs 1000, identity ≥ 0.9,
+        ///                    coverage ≥ 0.8, batch KmerCache + parallel shards
+        ///   fast           — containment-only pre-filter, lower identity threshold (0.5)
+        ///   cross-species  — k=7 anchors (5×) for 15-30% divergence (70-85% ANI homologs),
+        ///                    identity ≥ 0.5; detects matches solid k=31 seeding misses
         #[arg(long, default_value = "default")]
         preset: String,
 
@@ -468,7 +470,22 @@ fn main() -> Result<()> {
                 eff_min_query_coverage,
                 eff_batch,
                 eff_parallel_shards,
+                eff_cross_species,
             ) = match preset.as_str() {
+                "cross-species" => {
+                    log::info!(
+                        "Preset cross-species: k=7-8 anchors (5×), identity ≥ 0.5, \
+                         coverage ≥ 0.3 — detects homologs at 70-85% ANI"
+                    );
+                    (
+                        max_target_seqs,
+                        if (min_identity - 0.7).abs() < 1e-9 { 0.5 } else { min_identity },
+                        min_query_coverage,
+                        !no_batch,
+                        !no_parallel_shards,
+                        true,  // cross_species = true
+                    )
+                }
                 "amr" => {
                     // AMR surveillance: high recall (many hits per gene) but bounded.
                     // usize::MAX caused direct_align to run WFA against all 30K+
@@ -484,6 +501,7 @@ fn main() -> Result<()> {
                         if (min_query_coverage - 0.3).abs() < 1e-9 { 0.8 } else { min_query_coverage },
                         !no_batch,
                         !no_parallel_shards,
+                        false,  // cross_species
                     )
                 }
                 "fast" => {
@@ -494,9 +512,10 @@ fn main() -> Result<()> {
                         min_query_coverage,
                         !no_batch,
                         !no_parallel_shards,
+                        false,  // cross_species
                     )
                 }
-                _ => (max_target_seqs, min_identity, min_query_coverage, !no_batch, !no_parallel_shards),
+                _ => (max_target_seqs, min_identity, min_query_coverage, !no_batch, !no_parallel_shards, false),
             };
 
             let config = dragon::query::SearchConfig {
@@ -517,6 +536,7 @@ fn main() -> Result<()> {
                 ground_truth_genome: ground_truth,
                 batch_queries: eff_batch,
                 parallel_shards: eff_parallel_shards,
+                cross_species: eff_cross_species,
             };
 
             let results = if shard.is_empty() {

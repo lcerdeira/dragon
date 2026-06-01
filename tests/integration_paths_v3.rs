@@ -129,6 +129,7 @@ fn search_works_on_v3_migrated_index() {
         ground_truth_genome: None,
         batch_queries: true,
         parallel_shards: false,
+        cross_species: false,
     };
     let results = search(&q_path, &config).expect("search");
     let best = &results[0].alignments[0];

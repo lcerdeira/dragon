@@ -260,6 +260,10 @@ pub struct SearchConfig {
     /// Each shard loads its own index into memory; safe with mmap (OS demand-
     /// pages only what's accessed).  Default: true.
     pub parallel_shards: bool,
+    /// Cross-species mode: use k=7-8 anchors for 15-30% divergence.
+    /// Enables detection of homologs at 70-85% ANI (T2 cross-species tier).
+    /// Default: false (within-species, short-read mode).
+    pub cross_species: bool,
 }
 
 impl Default for SearchConfig {
@@ -281,6 +285,7 @@ impl Default for SearchConfig {
             ground_truth_genome: None,
             batch_queries: true,
             parallel_shards: true,
+            cross_species: false,
         }
     }
 }
@@ -418,6 +423,7 @@ pub fn search(
                 primary_k,
                 config.max_seed_freq,
                 cache,
+                config.cross_species,
             );
 
             if !hits.is_empty() {
@@ -440,6 +446,7 @@ pub fn search(
                         k,
                         config.max_seed_freq,
                         None, // cache built for primary_k; smaller k needs live lookups
+                        config.cross_species,
                     );
                     if !h.is_empty() {
                         best = h;

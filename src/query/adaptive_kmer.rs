@@ -58,8 +58,11 @@ const D_ASSUMED: f64 = 0.05;
 /// Below this, containment estimates are unreliable.
 const MIN_EXPECTED_SEEDS: f64 = 50.0;
 
-/// Absolute minimum k regardless of query length.
+/// Absolute minimum k for within-species / short-read mode.
 const K_MIN: usize = 15;
+
+/// Minimum k for cross-species mode (allows 15-30% divergence).
+pub const K_MIN_CROSS_SPECIES: usize = 7;
 
 /// Minimum candidate genomes before multi-k fallback is triggered.
 pub const MIN_CANDIDATES_FOR_EARLY_EXIT: usize = 1;
@@ -103,6 +106,24 @@ pub fn adaptive_k(query_len: usize, max_k: usize) -> usize {
 /// Starts at `primary_k` (adaptive), then falls back to larger steps if
 /// needed: [primary_k, primary_k-4, primary_k-8, ..., K_MIN].
 /// Each step reduces k by 4, giving a geometric improvement in sensitivity.
+/// Adaptive k for cross-species mode (allows k down to K_MIN_CROSS_SPECIES=7).
+///
+/// For sequences with 15-30% divergence (cross-species, 70-85% ANI):
+///   d=15%, k=7: P(exact) = 0.32 → 5 anchors give P(≥1) = 0.85
+///   d=20%, k=7: P(exact) = 0.21 → 5 anchors give P(≥1) = 0.69
+pub fn adaptive_k_cross_species(query_len: usize, max_k: usize) -> usize {
+    const TARGET_SEEDS: f64 = 30.0;  // Lower threshold — cross-species has fewer hits
+    const EST_DIV: f64 = 0.15;       // Assume up to 15% divergence
+
+    for k in (K_MIN_CROSS_SPECIES..=max_k).rev() {
+        let n = query_len.saturating_sub(k) + 1;
+        if n == 0 { continue; }
+        let expected = n as f64 * (1.0 - EST_DIV).powi(k as i32);
+        if expected >= TARGET_SEEDS { return k; }
+    }
+    K_MIN_CROSS_SPECIES
+}
+
 pub fn fallback_k_sequence(primary_k: usize) -> Vec<usize> {
     let mut ks = vec![primary_k];
     let mut k = primary_k;
@@ -144,6 +165,20 @@ mod tests {
     fn long_contig_keeps_max_k() {
         // 5000 bp: expected = 4970 × 0.20 = 994 seeds at k=31 → keep k=31
         assert_eq!(adaptive_k(5000, 31), 31);
+    }
+
+    #[test]
+    fn cross_species_allows_smaller_k() {
+        // Cross-species mode permits k down to K_MIN_CROSS_SPECIES (7) for
+        // high-divergence detection. A 1000bp query at 15% assumed divergence
+        // should reduce k below the within-species K_MIN (15).
+        let k = adaptive_k_cross_species(1000, 31);
+        assert!(k >= K_MIN_CROSS_SPECIES, "never below cross-species minimum 7");
+        assert!(k <= 31, "never above max_k");
+        // Short cross-species query should hit the floor
+        let k_short = adaptive_k_cross_species(60, 31);
+        assert_eq!(k_short, K_MIN_CROSS_SPECIES,
+            "short cross-species query floors at k=7, got {}", k_short);
     }
 
     #[test]
