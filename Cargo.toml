@@ -45,6 +45,7 @@ serde_json = "1"
 indicatif = "0.17"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 zstd = "0.13.3"
+flate2 = "1.1.9"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

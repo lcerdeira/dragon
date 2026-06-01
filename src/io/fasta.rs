@@ -1,8 +1,8 @@
-/// Streaming FASTA/FASTQ parser.
+/// Streaming FASTA/FASTQ parser with transparent gzip support.
 
 use anyhow::Result;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// A named DNA sequence.
@@ -12,10 +12,39 @@ pub struct Sequence {
     pub seq: Vec<u8>,
 }
 
-/// Read all sequences from a FASTA file.
+/// Open a path as a buffered reader, transparently decompressing gzip.
+///
+/// Detects gzip by the `.gz` extension OR the magic bytes (0x1f 0x8b), so it
+/// works for `.fa.gz`, `.fasta.gz`, `.fna.gz`, and also plain files renamed
+/// without the extension.  AllTheBacteria / NCBI / EBI genomes are distributed
+/// as gzip, so this is the common case for real-world inputs.
+///
+/// `flate2::MultiGzDecoder` handles multi-member gzip streams (concatenated
+/// `.gz` blocks), which some bulk genome archives use.
+pub fn open_maybe_gzip(path: &Path) -> Result<Box<dyn BufRead>> {
+    let mut file = File::open(path)?;
+
+    // Peek the first two bytes for the gzip magic number.
+    let mut magic = [0u8; 2];
+    let is_gzip = match file.read_exact(&mut magic) {
+        Ok(()) => magic == [0x1f, 0x8b],
+        Err(_) => false, // file shorter than 2 bytes — treat as plain
+    };
+    // Rewind to the start so the chosen reader sees the whole file.
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0))?;
+
+    if is_gzip {
+        let decoder = flate2::read::MultiGzDecoder::new(file);
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+/// Read all sequences from a FASTA file (plain or gzipped).
 pub fn read_sequences(path: &Path) -> Result<Vec<Sequence>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let reader = open_maybe_gzip(path)?;
     let mut sequences = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_seq = Vec::new();
@@ -75,18 +104,17 @@ pub fn read_sequences(path: &Path) -> Result<Vec<Sequence>> {
     Ok(sequences)
 }
 
-/// Iterator-based FASTA reader for streaming large files.
+/// Iterator-based FASTA reader for streaming large files (plain or gzipped).
 pub struct FastaReader {
-    reader: BufReader<File>,
+    reader: Box<dyn BufRead>,
     buf: String,
     peeked_header: Option<String>,
 }
 
 impl FastaReader {
     pub fn new(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
         Ok(Self {
-            reader: BufReader::new(file),
+            reader: open_maybe_gzip(path)?,
             buf: String::new(),
             peeked_header: None,
         })
@@ -153,9 +181,23 @@ fn list_fasta_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
         let path = entry.path();
         if path.is_dir() {
             list_fasta_files_recursive(&path, files)?;
-        } else if let Some(ext) = path.extension() {
-            let ext = ext.to_string_lossy().to_lowercase();
-            if matches!(ext.as_str(), "fa" | "fasta" | "fna" | "fsa") {
+        } else {
+            // Accept plain FASTA (.fa/.fasta/.fna/.fsa) AND gzipped variants
+            // (.fa.gz etc.).  We match on the full filename so that the
+            // double-extension `.fa.gz` is recognised (path.extension() would
+            // only return "gz").
+            let name = path.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let is_fasta = name.ends_with(".fa")
+                || name.ends_with(".fasta")
+                || name.ends_with(".fna")
+                || name.ends_with(".fsa")
+                || name.ends_with(".fa.gz")
+                || name.ends_with(".fasta.gz")
+                || name.ends_with(".fna.gz")
+                || name.ends_with(".fsa.gz");
+            if is_fasta {
                 files.push(path);
             }
         }
@@ -185,5 +227,67 @@ mod tests {
         assert_eq!(seqs[0].seq, b"ACGTACGTTTGGCCAA");
         assert_eq!(seqs[1].name, "seq2");
         assert_eq!(seqs[1].seq, b"AAAACCCC");
+    }
+
+    #[test]
+    fn test_read_gzipped_fasta() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.fa.gz");
+        let f = File::create(&path).unwrap();
+        let mut enc = GzEncoder::new(f, Compression::default());
+        writeln!(enc, ">seq1 description").unwrap();
+        writeln!(enc, "ACGTACGT").unwrap();
+        writeln!(enc, "TTGGCCAA").unwrap();
+        writeln!(enc, ">seq2").unwrap();
+        writeln!(enc, "AAAACCCC").unwrap();
+        enc.finish().unwrap();
+
+        // read_sequences must transparently decompress .fa.gz
+        let seqs = read_sequences(&path).unwrap();
+        assert_eq!(seqs.len(), 2, "gzip FASTA should yield 2 sequences");
+        assert_eq!(seqs[0].name, "seq1");
+        assert_eq!(seqs[0].seq, b"ACGTACGTTTGGCCAA");
+        assert_eq!(seqs[1].seq, b"AAAACCCC");
+    }
+
+    #[test]
+    fn test_list_includes_gzipped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mix of plain and gzipped FASTA + a non-FASTA file
+        File::create(dir.path().join("a.fa")).unwrap();
+        File::create(dir.path().join("b.fa.gz")).unwrap();
+        File::create(dir.path().join("c.fasta.gz")).unwrap();
+        File::create(dir.path().join("d.fna")).unwrap();
+        File::create(dir.path().join("readme.txt")).unwrap();
+
+        let files = list_fasta_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 4, "should list 4 FASTA (plain + gz), not the .txt");
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"b.fa.gz".to_string()), "must include .fa.gz");
+        assert!(names.contains(&"c.fasta.gz".to_string()), "must include .fasta.gz");
+        assert!(!names.iter().any(|n| n.ends_with(".txt")), "must exclude .txt");
+    }
+
+    #[test]
+    fn test_gzip_magic_byte_detection() {
+        // A gzipped file WITHOUT .gz extension must still be detected by magic bytes
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nogzext.fa"); // .fa but actually gzipped
+        let f = File::create(&path).unwrap();
+        let mut enc = GzEncoder::new(f, Compression::default());
+        writeln!(enc, ">s\nACGT").unwrap();
+        enc.finish().unwrap();
+
+        let seqs = read_sequences(&path).unwrap();
+        assert_eq!(seqs.len(), 1);
+        assert_eq!(seqs[0].seq, b"ACGT");
     }
 }
