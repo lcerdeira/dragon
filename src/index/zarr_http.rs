@@ -68,6 +68,16 @@ pub struct HttpZarrIndex {
     text_chunk_size: u64,
     /// Bitmap chunk size (bytes per chunk).
     bitmap_chunk_size: u64,
+    /// Decompressed-chunk cache, keyed by "{array}/{chunk_idx}".
+    ///
+    /// The binary search on the suffix array re-visits the same top-of-tree
+    /// chunks for every k-mer (the root region of the SA is touched by every
+    /// search).  Caching decompressed chunks turns the O(queries × log n)
+    /// HTTP fetches into O(distinct chunks) — the first query warms the cache,
+    /// subsequent queries hit it.  RefCell because search() takes &self.
+    chunk_cache: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<Vec<u8>>>>,
+    /// Running counter of actual HTTP GETs (for diagnostics / cache-hit rate).
+    http_gets: std::cell::Cell<u64>,
 }
 
 // ─── Zarr metadata deserialization ───────────────────────────────────────────
@@ -166,7 +176,14 @@ impl HttpZarrIndex {
             sa_chunk_size,
             text_chunk_size,
             bitmap_chunk_size,
+            chunk_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            http_gets: std::cell::Cell::new(0),
         })
+    }
+
+    /// Number of actual HTTP GETs performed (cache misses).
+    pub fn http_get_count(&self) -> u64 {
+        self.http_gets.get()
     }
 
     // ── SA access ────────────────────────────────────────────────────────────
@@ -307,20 +324,47 @@ impl HttpZarrIndex {
 
     // ── Internal HTTP chunk fetcher ───────────────────────────────────────────
 
-    fn fetch_chunk(&self, array_path: &str, chunk_idx: u64) -> Result<Vec<u8>> {
+    fn fetch_chunk(&self, array_path: &str, chunk_idx: u64) -> Result<std::rc::Rc<Vec<u8>>> {
+        let key = format!("{}/{}", array_path, chunk_idx);
+
+        // Cache hit: return the shared Rc without any HTTP traffic.
+        if let Some(cached) = self.chunk_cache.borrow().get(&key) {
+            return Ok(cached.clone());
+        }
+
+        // Cache miss: fetch + decompress, then store.
         let url = format!("{}/{}/c/{}", self.base_url, array_path, chunk_idx);
         let resp = self.client
             .get(&url)
             .send()
             .with_context(|| format!("GET {}", url))?;
-
         if !resp.status().is_success() {
             bail!("HTTP {} for {}", resp.status(), url);
         }
+        self.http_gets.set(self.http_gets.get() + 1);
 
-        let compressed = resp.bytes().context("read HTTP response body")?.to_vec();
-        zstd::decode_all(compressed.as_slice())
-            .with_context(|| format!("zstd decompress chunk {}", url))
+        let raw = resp.bytes().context("read HTTP response body")?.to_vec();
+        let decoded = std::rc::Rc::new(
+            maybe_zstd_decode(raw).with_context(|| format!("decode chunk {}", url))?,
+        );
+        self.chunk_cache.borrow_mut().insert(key, decoded.clone());
+        Ok(decoded)
+    }
+}
+
+/// Decompress a chunk only if it is a zstd frame.
+///
+/// Dragon's Zarr export compresses `/text`, `/suffix_array`, `/colors/bitmaps`
+/// and `/paths/blobs` with zstd, but stores `/unitig_lengths`, `/colors/offsets`
+/// and `/paths/offsets` UNCOMPRESSED.  Rather than track which array is which,
+/// we detect the zstd magic number (0x28 0xB5 0x2F 0xFD) at the start of the
+/// chunk and only decode when present; otherwise the bytes are returned as-is.
+fn maybe_zstd_decode(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+    if bytes.len() >= 4 && bytes[0..4] == ZSTD_MAGIC {
+        Ok(zstd::decode_all(bytes.as_slice())?)
+    } else {
+        Ok(bytes)
     }
 }
 
@@ -349,8 +393,9 @@ fn fetch_and_decompress(
     if !resp.status().is_success() {
         bail!("HTTP {} for {}", resp.status(), url);
     }
-    let compressed = resp.bytes().context("read body")?.to_vec();
-    zstd::decode_all(compressed.as_slice()).context("zstd decompress")
+    let raw = resp.bytes().context("read body")?.to_vec();
+    // /unitig_lengths is stored uncompressed; only decode if it's a zstd frame.
+    maybe_zstd_decode(raw)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -358,6 +403,24 @@ fn fetch_and_decompress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maybe_zstd_decode_passes_through_raw() {
+        // Raw (uncompressed) bytes — no zstd magic — returned as-is
+        let raw = vec![1u8, 0, 0, 0, 0, 0, 0, 0]; // a u64=1 LE, uncompressed
+        let out = maybe_zstd_decode(raw.clone()).unwrap();
+        assert_eq!(out, raw, "non-zstd bytes must pass through unchanged");
+    }
+
+    #[test]
+    fn maybe_zstd_decode_handles_zstd() {
+        // A real zstd frame round-trips
+        let original = b"ACGTACGTACGT".to_vec();
+        let compressed = zstd::encode_all(original.as_slice(), 3).unwrap();
+        assert_eq!(&compressed[0..4], &[0x28, 0xB5, 0x2F, 0xFD], "zstd magic present");
+        let out = maybe_zstd_decode(compressed).unwrap();
+        assert_eq!(out, original, "zstd frame must decompress");
+    }
 
     #[test]
     fn bytes_to_u64_le_basic() {

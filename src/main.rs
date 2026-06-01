@@ -1406,52 +1406,118 @@ echo "  Download complete."
                 Box::new(std::io::BufWriter::new(std::fs::File::create(&output)?))
             };
             use std::io::Write as _;
-            writeln!(writer, "query\thits\tunitig_id\toffset\tgenomes")?;
+            writeln!(writer, "query\tquery_len\tkmers_hit\tbest_genome\tbest_shared\tcontainment")?;
+
+            // k-mer seeding containment search.
+            //
+            // A whole-query exact match (the old behaviour) fails because a
+            // long query spans unitig junctions, where the FM-index text has
+            // separator bytes — so the contiguous query does not exist in the
+            // text.  Instead we extract k-mers (each guaranteed to lie within a
+            // single unitig), search each, map hits to genomes via the colour
+            // index, and rank genomes by k-mer containment — the same strategy
+            // as the in-memory pipeline, but every read is a chunked HTTP/file
+            // fetch.
+            //
+            // `kmer_search` is a closure: |kmer| -> Vec<(unitig_id)>
+            // `colors_of`  is a closure: |unitig_id| -> Vec<genome_id>
+            fn containment_over_zarr(
+                seq: &[u8],
+                k: usize,
+                mut kmer_positions: impl FnMut(&[u8]) -> anyhow::Result<Vec<u64>>,
+                mut pos_to_unitig: impl FnMut(u64) -> Option<(u32, u32)>,
+                mut colors_of: impl FnMut(u32) -> anyhow::Result<Vec<u32>>,
+            ) -> anyhow::Result<(usize, Option<(u32, usize)>)> {
+                use std::collections::HashMap;
+                if seq.len() < k {
+                    return Ok((0, None));
+                }
+                // Sample up to ~200 k-mers across the query (stride-based).
+                let total = seq.len() - k + 1;
+                let stride = (total / 200).max(1);
+                let mut genome_hits: HashMap<u32, usize> = HashMap::new();
+                let mut seen_unitig_colors: HashMap<u32, Vec<u32>> = HashMap::new();
+                let mut kmers_hit = 0usize;
+                let mut p = 0usize;
+                while p + k <= seq.len() {
+                    let kmer = &seq[p..p + k];
+                    let has_ambig = kmer.iter().any(|&b| {
+                        !matches!(b, b'A'|b'C'|b'G'|b'T'|b'a'|b'c'|b'g'|b't')
+                    });
+                    if !has_ambig {
+                        let positions = kmer_positions(kmer)?;
+                        if !positions.is_empty() && positions.len() <= 10_000 {
+                            kmers_hit += 1;
+                            // Collect distinct unitigs this k-mer maps to.
+                            let mut distinct = std::collections::HashSet::new();
+                            for pos in &positions {
+                                if let Some((uid, _)) = pos_to_unitig(*pos) {
+                                    distinct.insert(uid);
+                                }
+                            }
+                            for uid in distinct {
+                                if !seen_unitig_colors.contains_key(&uid) {
+                                    seen_unitig_colors.insert(uid, colors_of(uid)?);
+                                }
+                                for &g in &seen_unitig_colors[&uid] {
+                                    *genome_hits.entry(g).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                    p += stride;
+                }
+                let best = genome_hits.into_iter().max_by_key(|&(_, c)| c)
+                    .map(|(g, c)| (g, c));
+                Ok((kmers_hit, best))
+            }
 
             if is_http {
-                // ── Cloud mode: fetch only the chunks we need via HTTP ─────
                 let idx = dragon::index::zarr_http::HttpZarrIndex::open(&zarr_str)
                     .context("open HTTP Zarr index")?;
                 log::info!(
                     "HTTP Zarr: {} unitigs, {} genomes, k={}, SA={} entries",
                     idx.num_unitigs, idx.num_genomes, idx.kmer_size, idx.sa_len
                 );
+                let k = idx.kmer_size;
                 for rec in records {
-                    let positions = idx.search(&rec.seq)?;
-                    let n = positions.len();
-                    if n == 0 {
-                        writeln!(writer, "{}\t0\t\t\t", rec.name)?;
-                        continue;
-                    }
-                    for pos in positions.iter().take(64) {
-                        if let Some((uid, off)) = idx.position_to_unitig(*pos) {
-                            let bm = idx.get_colors(uid)?;
-                            let genomes: Vec<String> = bm.iter().map(|g: u32| g.to_string()).collect();
-                            writeln!(writer, "{}\t{}\t{}\t{}\t{}", rec.name, n, uid, off, genomes.join(","))?;
+                    let (kmers_hit, best) = containment_over_zarr(
+                        &rec.seq, k,
+                        |kmer| idx.search(kmer),
+                        |pos| idx.position_to_unitig(pos),
+                        |uid| Ok(idx.get_colors(uid)?.iter().collect()),
+                    )?;
+                    match best {
+                        Some((g, shared)) => {
+                            let containment = shared as f64 / kmers_hit.max(1) as f64;
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}",
+                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment)?;
                         }
+                        None => writeln!(writer, "{}\t{}\t0\t\t\t0", rec.name, rec.seq.len())?,
                     }
                 }
             } else {
-                // ── Local mode: use the existing FilesystemStore reader ────
                 let fm = dragon::index::zarr_backend::ZarrFmIndex::open(&zarr)?;
                 let colors = dragon::index::zarr_backend::ZarrColorIndex::open(&zarr)?;
                 log::info!(
                     "Filesystem Zarr: {} unitigs, {} genomes, k={}, {} text bytes",
                     fm.num_unitigs, fm.num_genomes, fm.kmer_size, fm.text_len
                 );
+                let k = fm.kmer_size;
                 for rec in records {
-                    let positions = fm.search(&rec.seq)?;
-                    let n = positions.len();
-                    if n == 0 {
-                        writeln!(writer, "{}\t0\t\t\t", rec.name)?;
-                        continue;
-                    }
-                    for pos in positions.iter().take(64) {
-                        if let Some((uid, off)) = fm.position_to_unitig(*pos) {
-                            let bm = colors.get_colors(uid)?;
-                            let genomes: Vec<String> = bm.iter().map(|g| g.to_string()).collect();
-                            writeln!(writer, "{}\t{}\t{}\t{}\t{}", rec.name, n, uid, off, genomes.join(","))?;
+                    let (kmers_hit, best) = containment_over_zarr(
+                        &rec.seq, k,
+                        |kmer| fm.search(kmer),
+                        |pos| fm.position_to_unitig(pos),
+                        |uid| Ok(colors.get_colors(uid)?.iter().collect()),
+                    )?;
+                    match best {
+                        Some((g, shared)) => {
+                            let containment = shared as f64 / kmers_hit.max(1) as f64;
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}",
+                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment)?;
                         }
+                        None => writeln!(writer, "{}\t{}\t0\t\t\t0", rec.name, rec.seq.len())?,
                     }
                 }
             }
