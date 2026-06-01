@@ -197,15 +197,19 @@ pub fn containment_rank(
             // ---- Pigeonhole fallback: if no hit from solid k-mer, try multi-anchor.
             //
             // Activated ONLY when the query is short (≤300bp) OR the adaptive k
-            // already dropped below the index k=31.  For long queries at k=31,
-            // the solid-hit miss rate is acceptable and anchor hits (k=10) would
-            // introduce low-specificity evidence that degrades candidate ranking.
-            // Short queries need anchors because their solid seeds are few and
-            // the pigeonhole gain is highest (P(≥1/3 exact | d=5%) ≈ 0.94).
-            // Pigeonhole activates for: short reads (≤300bp), reduced k, OR cross-species mode.
-            // Cross-species uses k=7 anchors (5×) for 15-30% divergence sensitivity.
-            let use_pigeonhole = !position_hit && kmer_size >= 7
-                && (query.len() <= 300 || kmer_size < 31 || cross_species);
+            // Pigeonhole activates WHENEVER the solid k-mer fails (!position_hit),
+            // for queries of ANY length — this is the key to matching Minimap2 /
+            // LexicMap sensitivity. A divergent gene-length query (500–2000 bp)
+            // misses its solid 31-mers just like a short read does; multi-anchor
+            // seeding recovers it (P(≥1/3 anchors exact | d=5%) ≈ 0.94).
+            //
+            // Crucially this costs NOTHING at low divergence: when the solid
+            // k-mer hits (position_hit=true), this branch is skipped entirely.
+            // Only divergent query positions — exactly where we need recall —
+            // pay for the extra anchor lookups. Specificity is preserved by the
+            // IDF/centrality candidate ranking downstream, which down-weights the
+            // promiscuous short-anchor hits.
+            let use_pigeonhole = !position_hit && kmer_size >= 7;
             if use_pigeonhole {
                 let anchor_cfg = if cross_species {
                     crate::query::spaced_seed::AnchorConfig::for_cross_species()
