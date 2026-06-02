@@ -110,9 +110,9 @@ pub fn containment_rank(
     } else {
         SprtState::default_for_kmer31()
     };
-    // Set once we have accepted H₁; we continue processing normally but skip
-    // further SPRT updates since the decision is already made.
-    let mut sprt_accepted_h1 = false;
+    // Set once the SPRT reaches a decision (H₀ or H₁); we then continue
+    // processing normally but skip further SPRT updates.
+    let mut sprt_decided = false;
 
     let mut p = 0usize;
     while p + kmer_size <= query.len() {
@@ -186,10 +186,22 @@ pub fn containment_rank(
                 }
             }
             // Update SPRT once per query position using the forward-strand result.
-            if !sprt_accepted_h1 {
+            //
+            // CRITICAL: AcceptH0 must NOT discard the query. The SPRT's H₁ hit
+            // rate (p₁ = 0.98³¹ ≈ 0.53) is calibrated for ~2% divergence; a
+            // divergent-but-present query (10–15%) has a solid-k-mer hit rate of
+            // only ~3–9%, which the SPRT cannot distinguish from absence, so it
+            // would fire AcceptH0 after ~4 early misses and `return` — throwing
+            // away a real match (and any pigeonhole anchors already collected).
+            // This was the dominant recall ceiling vs LexicMap (77% @ 15% div).
+            //
+            // Instead, treat EITHER decision as "stop updating the SPRT" and keep
+            // sampling so the pigeonhole fallback (shorter k=7–10 anchors) can
+            // seed the divergent regions. Truly-absent queries still terminate
+            // correctly via the `kmer_hits.is_empty()` check below.
+            if !sprt_decided {
                 match sprt.update(position_hit) {
-                    SprtDecision::AcceptH0 => return Vec::new(),
-                    SprtDecision::AcceptH1 => sprt_accepted_h1 = true,
+                    SprtDecision::AcceptH0 | SprtDecision::AcceptH1 => sprt_decided = true,
                     SprtDecision::Continue => {}
                 }
             }
