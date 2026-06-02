@@ -377,17 +377,30 @@ pub fn containment_rank(
         })
         .collect();
 
-    // Sort by Bayesian posterior P(match) descending, break ties by info_score.
-    // Bayesian prob is preferred over raw containment because it accounts for
-    // sample size: short reads (fewer sampled k-mers) get appropriately wider
-    // posteriors, preventing overconfident ranking of uncertain containment scores.
+    // Sort by IDF-weighted information content (info_score) descending, breaking
+    // ties by Bayesian posterior P(match).
+    //
+    // WHY info_score FIRST (not raw containment / bayes_prob):
+    // At high divergence the TRUE source shares only a few k-mers with the query
+    // — but they include the query's RARE, discriminative k-mers (high IDF,
+    // ic = log2(N/cardinality)). A WRONG genome that merely shares the query's
+    // conserved/core k-mers accumulates a comparable raw shared-count (so a
+    // similar bayes_prob) but its IDF contribution is ≈0 (core k-mers have
+    // cardinality ≈ N → ic ≈ 0). Ranking by bayes_prob/containment therefore
+    // let core-sharing impostors outrank the true source, pushing it below the
+    // alignment cutoff (top max_target_seqs) so it was never aligned — the
+    // dominant high-divergence recall gap vs LexicMap (d15: 46% vs 100%).
+    //
+    // info_score down-weights core k-mers to ~0 automatically, so the source's
+    // rare-k-mer evidence dominates and it ranks into the aligned set.
     hits.sort_by(|a, b| {
-        let a_score = a.bayes_prob.unwrap_or(a.containment);
-        let b_score = b.bayes_prob.unwrap_or(b.containment);
-        b_score.partial_cmp(&a_score)
+        b.info_score.partial_cmp(&a.info_score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.info_score.partial_cmp(&a.info_score)
-                .unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                let a_score = a.bayes_prob.unwrap_or(a.containment);
+                let b_score = b.bayes_prob.unwrap_or(b.containment);
+                b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     hits
