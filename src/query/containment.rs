@@ -100,6 +100,9 @@ pub fn containment_rank(
     let mut kmer_hits: Vec<KmerHit> = Vec::new();
     let mut unitig_colors: HashMap<u32, RoaringBitmap> = HashMap::new();
     let mut n_sampled = 0usize;
+    // Query positions where the solid k-mer missed (candidates for the
+    // pigeonhole FALLBACK — see the gated pass after the sampling loop).
+    let mut pigeon_positions: Vec<usize> = Vec::new();
 
     // SPRT: one state per containment_rank call — tests whether ANY k-mer hit
     // is observed (query-level: "does this query appear in ANY genome?").
@@ -206,66 +209,71 @@ pub fn containment_rank(
                 }
             }
 
-            // ---- Pigeonhole fallback: if no hit from solid k-mer, try multi-anchor.
-            //
-            // Activated ONLY when the query is short (≤300bp) OR the adaptive k
-            // Pigeonhole activates WHENEVER the solid k-mer fails (!position_hit),
-            // for queries of ANY length — this is the key to matching Minimap2 /
-            // LexicMap sensitivity. A divergent gene-length query (500–2000 bp)
-            // misses its solid 31-mers just like a short read does; multi-anchor
-            // seeding recovers it (P(≥1/3 anchors exact | d=5%) ≈ 0.94).
-            //
-            // Crucially this costs NOTHING at low divergence: when the solid
-            // k-mer hits (position_hit=true), this branch is skipped entirely.
-            // Only divergent query positions — exactly where we need recall —
-            // pay for the extra anchor lookups. Specificity is preserved by the
-            // IDF/centrality candidate ranking downstream, which down-weights the
-            // promiscuous short-anchor hits.
-            let use_pigeonhole = !position_hit && kmer_size >= 7;
-            if use_pigeonhole {
-                let anchor_cfg = if cross_species {
-                    crate::query::spaced_seed::AnchorConfig::for_cross_species()
-                } else {
-                    AnchorConfig::default()
-                };
-                let window = &query[p..p.saturating_add(kmer_size).min(query.len())];
-                if window.len() >= anchor_cfg.min_window() {
-                    let (_, anchor_hits) = pigeonhole_search(
-                        query, p, kmer_size, fm_index, max_seed_freq, &anchor_cfg,
-                    );
-                    if !anchor_hits.is_empty() {
-                        // Collect unique unitig IDs from anchor hits
-                        let mut seen = RoaringBitmap::new();
-                        let mut unitigs: Vec<u32> = Vec::new();
-                        let mut seeds: Vec<SeedHit> = Vec::new();
-                        for hit in &anchor_hits {
-                            if seen.insert(hit.unitig_id) {
-                                unitigs.push(hit.unitig_id);
-                                seeds.push(hit.clone());
-                                unitig_colors.entry(hit.unitig_id).or_insert_with(|| {
-                                    if let Some(cache) = kmer_cache {
-                                        if let Some(bm) = cache.get_colors(hit.unitig_id) {
-                                            return bm.clone();
-                                        }
-                                    }
-                                    color_index.get_colors(hit.unitig_id).unwrap_or_default()
-                                });
-                            }
-                        }
-                        if !unitigs.is_empty() {
-                            kmer_hits.push(KmerHit {
-                                qpos: p,
-                                is_reverse: false,
-                                unitigs,
-                                seeds,
-                            });
-                        }
-                    }
-                }
+            // Record solid-miss positions for the pigeonhole FALLBACK pass.
+            // We do NOT run pigeonhole inline per-position: doing so floods the
+            // candidate pool with ~1M low-specificity core anchors on a 1 kb
+            // query that has scattered edits (e.g. d3, ~13 edits → ~400 misses ×
+            // ~2500 anchors). That noise (a) crowds the true region out of
+            // candidate selection and (b) corrupts the per-genome anchor cluster
+            // so even genomes that CONTAIN the query align at ~50% (observed:
+            // q25 aligned its own 98.7%-identical source at 52%). The decision
+            // to spend anchors is made ONCE, after we know the global solid-hit
+            // strength — see the gated pass below.
+            if !position_hit && kmer_size >= 7 {
+                pigeon_positions.push(p);
             }
         }
         p += stride;
     }
+
+    // ---- Pigeonhole FALLBACK (query-level, not per-position) ----
+    // Solid 31-mer anchors are precise; pigeonhole (short k=7–10 anchors) is a
+    // recall fallback for queries where solid seeding is too sparse to identify
+    // candidates (short reads, high divergence). Running it only when solid
+    // signal is WEAK keeps it from flooding/ corrupting queries that already
+    // have ample solid anchors. `kmer_hits` here holds solid hits only.
+    const MIN_SOLID_ANCHORS: usize = 30;
+    let solid_weak = kmer_hits.len() < MIN_SOLID_ANCHORS;
+    if solid_weak && !pigeon_positions.is_empty() {
+        let anchor_cfg = if cross_species {
+            crate::query::spaced_seed::AnchorConfig::for_cross_species()
+        } else {
+            AnchorConfig::default()
+        };
+        let min_window = anchor_cfg.min_window();
+        for &p in &pigeon_positions {
+            let window = &query[p..p.saturating_add(kmer_size).min(query.len())];
+            if window.len() < min_window {
+                continue;
+            }
+            let (_, anchor_hits) =
+                pigeonhole_search(query, p, kmer_size, fm_index, max_seed_freq, &anchor_cfg);
+            if anchor_hits.is_empty() {
+                continue;
+            }
+            let mut seen = RoaringBitmap::new();
+            let mut unitigs: Vec<u32> = Vec::new();
+            let mut seeds: Vec<SeedHit> = Vec::new();
+            for hit in &anchor_hits {
+                if seen.insert(hit.unitig_id) {
+                    unitigs.push(hit.unitig_id);
+                    seeds.push(hit.clone());
+                    unitig_colors.entry(hit.unitig_id).or_insert_with(|| {
+                        if let Some(cache) = kmer_cache {
+                            if let Some(bm) = cache.get_colors(hit.unitig_id) {
+                                return bm.clone();
+                            }
+                        }
+                        color_index.get_colors(hit.unitig_id).unwrap_or_default()
+                    });
+                }
+            }
+            if !unitigs.is_empty() {
+                kmer_hits.push(KmerHit { qpos: p, is_reverse: false, unitigs, seeds });
+            }
+        }
+    }
+
     if kmer_hits.is_empty() {
         return Vec::new();
     }
