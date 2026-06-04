@@ -7,7 +7,7 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19478347.svg)](https://doi.org/10.5281/zenodo.19478347)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-99%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-163%20passing-brightgreen.svg)](#testing)
 
 Dragon aligns query sequences (genes, plasmids, long/short reads, raw nanopore signal) against millions of prokaryotic genomes while using dramatically less disk and RAM than existing tools.
 
@@ -103,6 +103,7 @@ Dragon detects GGCAT automatically. Without it, the built-in graph builder handl
 | `dragon search-zarr` | Pattern-search a Zarr-backed index (local path or `s3://` URI) |
 | `dragon signal-index` | Build a signal-level index from FASTA via a pore model |
 | `dragon signal-search` | Align raw nanopore current signals (TSV/CSV/SLOW5) directly |
+| `dragon migrate-paths` | Stream-convert a legacy `paths.bin` to the mmap-friendly format |
 
 Run `dragon <subcommand> --help` for the full option list.
 
@@ -113,6 +114,7 @@ Run `dragon <subcommand> --help` for the full option list.
 | `--index` | required | Primary index directory |
 | `--shard` (repeatable) | — | Additional shard directories for multi-index search |
 | `--query` | required | Query FASTA/FASTQ file |
+| `--preset` | `default` | Tuning bundle: `default`, `cross-species`, `amr`, `fast` (see below) |
 | `--format` | `paf` | Output: `paf`, `blast6`, `summary`, `gfa` |
 | `--profile` | `workstation` | `laptop` (≤8 GB RAM, 4 threads) or `workstation` (full resources) |
 | `--threads` | 4 | CPU threads |
@@ -120,8 +122,30 @@ Run `dragon <subcommand> --help` for the full option list.
 | `--min-seed-len` | 15 | Minimum seed match length |
 | `--min-identity` | 0.7 | Minimum alignment identity to report |
 | `--min-query-coverage` | 0.3 | Minimum query coverage to report |
-| `--max-target-seqs` | 10 | Hits per query |
+| `--min-score-ratio` | 0.1 | Keep hits scoring ≥ ratio × best hit |
+| `--max-target-seqs` | 10 | Hits per query (`0` = uncapped) |
+| `--no-batch` | off | Disable batch-query KmerCache (per-query processing) |
+| `--no-parallel-shards` | off | Load shards one at a time (lower peak RAM) |
 | `--no-ml` | off | Disable learned seed scoring (use raw match length) |
+
+### Search presets
+
+`--preset` sets sensible defaults for common scenarios; explicit flags always override the preset.
+
+| Preset | What it does | Use when |
+| --- | --- | --- |
+| `default` | Balanced: `--max-target-seqs 10`, `--min-identity 0.7`. Solid 31-mer seeds with a pigeonhole multi-anchor fallback that fires only when solid seeding is sparse (short reads / high divergence). | Within-species search, genes, plasmids, reads |
+| `cross-species` | Short k=7–8 anchors (5×), `--min-identity 0.5` — recovers homologs at 70–85% ANI that solid 31-mers miss. | Cross-genus / distant-homolog detection |
+| `amr` | `--max-target-seqs 1000`, `--min-identity 0.9`, `--min-query-coverage 0.8`, batch KmerCache + parallel shards. | AMR gene panels against a whole species |
+| `fast` | Containment pre-filter, `--min-identity 0.5`, batch + parallel shards. | Quick triage / large query panels |
+
+```bash
+# AMR surveillance: 1,000+ hits per gene across a species, batch-accelerated
+dragon search -i saureus/b1 --shard saureus/b2 ... -q card_amr.fa --preset amr -j 16
+
+# Distant homolog search (cross-genus)
+dragon search -i gtdb/b1 --shard gtdb/b2 ... -q gene.fa --preset cross-species
+```
 
 ### Output formats
 
@@ -129,6 +153,55 @@ Run `dragon <subcommand> --help` for the full option list.
 - **BLAST6** — BLAST-tabular `outfmt 6`.
 - **summary** — per-species prevalence + identity distribution (surveillance-ready).
 - **gfa** — graph-context unitigs around each hit (for mobile-element analysis).
+
+## Cloud-native access (Zarr over S3)
+
+`dragon export-zarr` rewrites an index as a [Zarr v3](https://zarr.dev) store — chunked and Zstd-compressed — so it can be **queried directly from object storage without downloading the whole index**. The FM-index, colour bitmaps, and unitig text become chunked arrays; a query fetches only the chunks it touches via HTTP range requests, decompresses them on the fly (Zstd magic-byte sniffing, so mixed-codec stores work), and caches them per-query.
+
+```bash
+# 1. Export a binary index to a Zarr store
+dragon export-zarr -i saureus/b1 -o saureus_b1.zarr
+
+# 2. Upload to your own bucket (public-read or credentialed)
+aws s3 cp --recursive saureus_b1.zarr s3://dragon-zarr/saureus/b1.zarr
+
+# 3a. Query straight from S3 over HTTPS — nothing downloaded up front
+dragon search-zarr \
+    --zarr https://dragon-zarr.s3.eu-west-2.amazonaws.com/saureus/b1.zarr \
+    -q queries.fa -o hits.tsv
+
+# 3b. ...or with an s3:// URI / local path
+dragon search-zarr -z s3://dragon-zarr/saureus/b1.zarr -q queries.fa
+```
+
+The store is also readable by any Zarr-aware tool (zarr-python, xarray, s3fs) — see `scripts/zarr_demo.py`. This is what lets a laptop query a multi-terabyte database it could never hold locally: only the touched, compressed chunks cross the wire.
+
+> `search-zarr` reports matching text positions + unitig IDs (cloud-native seed discovery). For full base-level alignment, run `dragon search` against a binary index (local or downloaded).
+
+## Pre-built indices
+
+We are publishing four single-/multi-species indices plus a full AllTheBacteria index (the same collection LexicMap ships) under the public-read bucket **`s3://dragon-zarr/`** (eu-west-2, `--no-sign-request`). Each is offered two ways: **(a)** a binary index to download for local/HPC `dragon search`, and **(b)** a Zarr store to query in place with `dragon search-zarr`.
+
+| Database | Genomes | Scope | Shards | Index status | Location |
+| --- | --- | --- | --- | --- | --- |
+| **S. aureus** | 104,323 | single species | 7 × 16K | ✓ built | `s3://dragon-zarr/saureus/` |
+| **K. pneumoniae** | 57,077 | single species | 2 | ✓ built | `s3://dragon-zarr/kpneumoniae/` |
+| **E. coli** | 315,066 | single species | building | downloading/indexing | `s3://dragon-zarr/ecoli/` |
+| **GTDB r220** | 113,106 | cross-species (≥1 representative / species) | 6 × 18.8K | ✓ built | `s3://dragon-zarr/gtdb/` |
+| **AllTheBacteria v2** | ~2,290,000 | all bacteria (LexicMap parity) | sharded (in progress) | building | `s3://dragon-zarr/atb/` |
+
+S3 publication is rolling out per database — a 16,000-genome S. aureus demo shard is already public at `s3://dragon-zarr/saureus/b1` (see the demo at the top of this README). Until a given store is uploaded, you can build any of these locally:
+
+```bash
+# Build any species set from a FASTA directory (.fa / .fa.gz both supported)
+dragon index -i ./genomes/ -o ./my_index/ -k 31 -j 16 --auto   # --auto shards by RAM
+
+# Or fetch a pre-built index / source genomes
+dragon download -d gtdb-r220          -o ./gtdb/      # pre-built index
+dragon download -d allthebacteria     -o ./atb_fasta/ # source genomes, then `dragon index`
+```
+
+Index size scales with sequence **diversity**, not raw genome count: single-species sets (high redundancy) stay compact and laptop-friendly (S. aureus FM-index ~400 MB for 8K genomes), whereas pan-kingdom sets like GTDB/ATB grow with the novel sequence each clade contributes and suit workstation/HPC RAM.
 
 ## Architecture
 
@@ -168,7 +241,7 @@ SIGNAL SEARCH
 ## Testing
 
 ```bash
-cargo test --lib                # 99 unit tests
+cargo test --lib                # 163 unit tests
 cargo test                      # + integration tests
 cargo bench                     # criterion micro-benchmarks
 ```
@@ -189,7 +262,7 @@ Key references:
 ```
 dragon/
 ├── src/
-│   ├── main.rs              CLI entry point (11 subcommands)
+│   ├── main.rs              CLI entry point (12 subcommands)
 │   ├── index/               Index construction
 │   │   ├── dbg.rs           ccdBG via GGCAT (fallback: internal builder)
 │   │   ├── unitig.rs        2-bit packed unitig encoding
