@@ -30,7 +30,27 @@ It exploits the redundancy among related genomes through:
 | **Per-species surveillance summary** | Yes | No | No | No |
 | **Hardware profile (laptop mode)** | Yes | No | partial | partial |
 
-A 16,000-genome demo index lives at `s3://dragon-zarr/saureus/b1/` (eu-west-2, public-read). No credentials needed:
+### Try it in 60 seconds
+
+Query a live Dragon index hosted on public S3, **over HTTPS, with no credentials and nothing downloaded up front** — `search-zarr` fetches only the compressed chunks it needs:
+
+```bash
+cargo build --release
+curl -sO https://dragon-zarr.s3.eu-west-2.amazonaws.com/demo/query.fa
+./target/release/dragon search-zarr \
+    --zarr https://dragon-zarr.s3.eu-west-2.amazonaws.com/demo/index.zarr \
+    -q query.fa
+# core_fragment   -> found in all 6 demo genomes (containment ~0.94)
+# resistance_gene -> found only in the 2 carrier genomes (containment ~0.91)
+```
+
+Or run the whole `index → export-zarr → search-zarr` pipeline locally on bundled demo data (one command, no S3):
+
+```bash
+bash scripts/zarr_quickstart.sh
+```
+
+A Python/Zarr-native demo (zarr-python, s3fs, xarray) against a 16,000-genome *S. aureus* shard also works without credentials:
 
 ```bash
 pip install 'zarr>=3.0' s3fs numcodecs
@@ -287,6 +307,8 @@ dragon/
 │   ├── ds/                  Fenwick tree, Elias-Fano, varint codecs
 │   └── util/                DNA encoding, mmap, colorspace (SOLiD), progress
 ├── scripts/
+│   ├── make_demo_data.py    Generate the tiny self-contained demo dataset
+│   ├── zarr_quickstart.sh   One-command index → export-zarr → search-zarr demo
 │   ├── zarr_demo.py         Read a Zarr store from local or s3:// (paper §4.8 demo)
 │   └── train_seed_scorer.py Train the logistic-regression ML seed weights
 ├── tests/                   Integration tests
