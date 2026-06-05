@@ -48,6 +48,17 @@ pub struct SignalSearchConfig {
     pub max_results: usize,
     /// Number of threads.
     pub threads: usize,
+    /// Run event detection on the query (segment variable-dwell raw samples into
+    /// ~1 event per base) before normalize/discretize. REQUIRED for real reads,
+    /// where each base spans ~8–13 samples; the per-sample index expects ~1/base.
+    /// Default: true. (The 1-sample/k-mer simulation could leave this off.)
+    pub use_events: bool,
+    /// Event-detector half-window (samples). Default: 4.
+    pub event_window: usize,
+    /// Event-detector t-statistic threshold. Default: 2.0.
+    pub event_threshold: f32,
+    /// Minimum samples between event boundaries. Default: 3.
+    pub min_event_len: usize,
 }
 
 impl Default for SignalSearchConfig {
@@ -59,6 +70,10 @@ impl Default for SignalSearchConfig {
             max_seed_freq: 10_000,
             max_results: 50,
             threads: 4,
+            use_events: true,
+            event_window: 4,
+            event_threshold: 2.0,
+            min_event_len: 3,
         }
     }
 }
@@ -93,8 +108,21 @@ pub fn search_signal(
         return Vec::new();
     }
 
-    // Step 1: Normalize and discretize query signal
-    let normalized = discretize::normalize_signal(signal_data);
+    // Step 1: (optional) event-detect to collapse variable-dwell samples to ~1
+    // level/base, then normalize and discretize. Real reads MUST be event-detected
+    // (≈8–13 samples/base) to align with the index's per-base expected signal;
+    // the 1-sample/k-mer simulation can skip it via use_events=false.
+    let events: Vec<f32> = if config.use_events {
+        discretize::detect_event_means(
+            signal_data,
+            config.event_window,
+            config.event_threshold,
+            config.min_event_len,
+        )
+    } else {
+        signal_data.to_vec()
+    };
+    let normalized = discretize::normalize_signal(&events);
     let discretized = discretize::discretize_normalized(&normalized, alphabet);
 
     if discretized.len() < config.signal_kmer_size {
@@ -594,6 +622,9 @@ mod tests {
             min_hits: 1,
             max_seed_freq: 100_000,
             max_results: 10,
+            // This query is already per-base expected signal (no dwell), so skip
+            // event detection — that path is exercised by the discretize tests.
+            use_events: false,
             ..Default::default()
         };
 

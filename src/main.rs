@@ -257,6 +257,23 @@ enum Commands {
         /// Number of threads
         #[arg(short = 'j', long, default_value = "4")]
         threads: usize,
+
+        /// Disable event detection (treat raw samples 1:1). Only correct for
+        /// 1-sample-per-base inputs; real reads need event detection (default on).
+        #[arg(long)]
+        no_events: bool,
+
+        /// Event-detector half-window in samples (default: 4)
+        #[arg(long, default_value = "4")]
+        event_window: usize,
+
+        /// Event-detector t-statistic threshold (default: 2.0)
+        #[arg(long, default_value = "2.0")]
+        event_threshold: f32,
+
+        /// Minimum samples between event boundaries (default: 3)
+        #[arg(long, default_value = "3")]
+        min_event_len: usize,
     },
 
     /// Add new genomes to an existing index without full rebuild
@@ -1215,10 +1232,15 @@ echo "  Download complete."
             max_seed_freq,
             max_results,
             threads,
+            no_events,
+            event_window,
+            event_threshold,
+            min_event_len,
         } => {
             log::info!("Dragon signal search");
             log::info!("Index: {:?}", index);
             log::info!("Query: {:?}", query);
+            log::info!("Event detection: {}", if no_events { "OFF (raw 1:1)" } else { "ON" });
 
             let config = dragon::signal::SignalSearchConfig {
                 index_dir: index.into(),
@@ -1227,6 +1249,10 @@ echo "  Download complete."
                 max_seed_freq,
                 max_results,
                 threads,
+                use_events: !no_events,
+                event_window,
+                event_threshold,
+                min_event_len,
             };
 
             let results = dragon::signal::search::search_signal_file(&query, &config)?;

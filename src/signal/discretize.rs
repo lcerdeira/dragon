@@ -165,6 +165,71 @@ pub fn discretize_signal(raw: &[f32], alphabet: &SignalAlphabet) -> Vec<u8> {
         .collect()
 }
 
+/// Segment a raw nanopore signal into events (one representative level per base).
+///
+/// Real reads contain ~8–13 *variable*-dwell samples per translocated base (e.g.
+/// ~12.5 at 400 b/s, 5 kHz), whereas the signal index stores ~one expected
+/// current per base. Feeding raw samples to the per-base k-mer search therefore
+/// never aligns. This collapses runs of similar samples into events using a
+/// moving t-test change-point detector (cf. scrappie / nanopolish): a boundary is
+/// placed at each local maximum of the windowed t-statistic that exceeds
+/// `threshold` and is ≥ `min_event_len` samples from the previous boundary; each
+/// event's value is the mean current of its samples. The output length is ≈ the
+/// number of bases, matching the index's per-base expected signal.
+pub fn detect_event_means(
+    raw: &[f32],
+    window: usize,
+    threshold: f32,
+    min_event_len: usize,
+) -> Vec<f32> {
+    let n = raw.len();
+    let w = window.max(1);
+    if n < 2 * w + 1 {
+        let m = if n == 0 { 0.0 } else { raw.iter().copied().sum::<f32>() / n as f32 };
+        return vec![m];
+    }
+    // Prefix sums for O(1) window mean / variance.
+    let mut ps = vec![0f64; n + 1];
+    let mut ps2 = vec![0f64; n + 1];
+    for i in 0..n {
+        ps[i + 1] = ps[i] + raw[i] as f64;
+        ps2[i + 1] = ps2[i] + (raw[i] as f64) * (raw[i] as f64);
+    }
+    let win_stats = |a: usize, b: usize| -> (f64, f64) {
+        let cnt = (b - a) as f64;
+        let mean = (ps[b] - ps[a]) / cnt;
+        let var = ((ps2[b] - ps2[a]) / cnt - mean * mean).max(0.0);
+        (mean, var)
+    };
+    // Windowed t-statistic at each candidate boundary i: compares [i-w, i) vs [i, i+w).
+    let mut tstat = vec![0f32; n];
+    for i in w..(n - w) {
+        let (m1, v1) = win_stats(i - w, i);
+        let (m2, v2) = win_stats(i, i + w);
+        let denom = (((v1 + v2) / w as f64).sqrt()).max(1e-6);
+        tstat[i] = ((m1 - m2).abs() / denom) as f32;
+    }
+    // Boundaries: local maxima above threshold, spaced ≥ min_event_len.
+    let mle = min_event_len.max(1);
+    let mut bounds = vec![0usize];
+    let mut last = 0usize;
+    for i in (w + 1)..(n - w - 1) {
+        if tstat[i] > threshold
+            && tstat[i] >= tstat[i - 1]
+            && tstat[i] > tstat[i + 1]
+            && i - last >= mle
+        {
+            bounds.push(i);
+            last = i;
+        }
+    }
+    bounds.push(n);
+    bounds
+        .windows(2)
+        .map(|wnd| ((ps[wnd[1]] - ps[wnd[0]]) / (wnd[1] - wnd[0]) as f64) as f32)
+        .collect()
+}
+
 /// Discretize an already-normalized signal.
 pub fn discretize_normalized(normalized: &[f32], alphabet: &SignalAlphabet) -> Vec<u8> {
     normalized
@@ -217,6 +282,47 @@ mod tests {
         let alpha = SignalAlphabet::default();
         assert_eq!(alpha.num_levels, 16);
         assert!((alpha.bin_width() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_detect_event_means_recovers_steps() {
+        // Simulate variable-dwell raw signal: 5 bases, each a distinct current
+        // level held for 8-14 samples with small Gaussian-ish jitter.
+        let levels = [90.0f32, 75.0, 110.0, 60.0, 100.0];
+        let dwells = [12usize, 9, 14, 8, 11];
+        let mut raw = Vec::new();
+        let mut seed = 12345u32;
+        let mut nrand = || {
+            // cheap deterministic pseudo-noise in [-1.5, 1.5]
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 16) as f32 / 65535.0 - 0.5) * 3.0
+        };
+        for (lvl, &d) in levels.iter().zip(dwells.iter()) {
+            for _ in 0..d {
+                raw.push(lvl + nrand());
+            }
+        }
+        let events = detect_event_means(&raw, 4, 2.0, 3);
+        // Should recover ~5 events (allow ±1 for boundary effects).
+        assert!(
+            (4..=6).contains(&events.len()),
+            "expected ~5 events, got {}",
+            events.len()
+        );
+        // The set of event means should be close to the true levels.
+        for lvl in levels.iter() {
+            let close = events.iter().any(|&e| (e - lvl).abs() < 6.0);
+            assert!(close, "no event near level {} in {:?}", lvl, events);
+        }
+    }
+
+    #[test]
+    fn test_detect_event_means_short_signal() {
+        // Shorter than 2*window+1 -> single event (the mean).
+        let raw = [10.0f32, 11.0, 9.0];
+        let ev = detect_event_means(&raw, 4, 2.0, 3);
+        assert_eq!(ev.len(), 1);
+        assert!((ev[0] - 10.0).abs() < 1.0);
     }
 
     #[test]
