@@ -2,14 +2,14 @@
   <img src="assets/dragon-logo.png" alt="Dragon Logo" width="300">
 </p>
 
-<p align="center"><strong>Dragon: a cloud-native, signal-aware aligner for surveillance-scale microbial genomics</strong></p>
+<p align="center"><strong>Dragon: a cloud-native aligner for surveillance-scale microbial genomics</strong></p>
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19478347.svg)](https://doi.org/10.5281/zenodo.19478347)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-163%20passing-brightgreen.svg)](#testing)
 
-Dragon aligns query sequences (genes, plasmids, long/short reads, raw nanopore signal) against millions of prokaryotic genomes while using dramatically less disk and RAM than existing tools.
+Dragon aligns query sequences (genes, plasmids, long/short reads) against millions of prokaryotic genomes while using dramatically less disk and RAM than existing tools.
 
 It exploits the redundancy among related genomes through:
 
@@ -26,7 +26,6 @@ It exploits the redundancy among related genomes through:
 | **Query RAM** | <4 GB | 4–25 GB | scales linearly | scales linearly |
 | **Multi-shard search** | Yes `--shard` | No | No | No |
 | **Cloud-native (S3 random read)** | Yes / Zarr v3 | No | No | No |
-| **Raw nanopore signal search** | Yes | No | No | No |
 | **Per-species surveillance summary** | Yes | No | No | No |
 | **Hardware profile (laptop mode)** | Yes | No | partial | partial |
 
@@ -121,8 +120,8 @@ Dragon detects GGCAT automatically. Without it, the built-in graph builder handl
 | `dragon summarize` | Produce a per-species prevalence/identity report from PAF output |
 | `dragon export-zarr` | Export an index as a Zarr v3 store (cloud-native, chunked) |
 | `dragon search-zarr` | Pattern-search a Zarr-backed index (local path or `s3://` URI) |
-| `dragon signal-index` | Build a signal-level index from FASTA via a pore model |
-| `dragon signal-search` | Align raw nanopore current signals (TSV/CSV/SLOW5) directly |
+| `dragon signal-index` | _(experimental, not validated on real data — see [#16](https://github.com/lcerdeira/dragon/issues/16))_ Build a signal-level index from FASTA via a pore model |
+| `dragon signal-search` | _(experimental, not validated on real data)_ Align raw nanopore current signals (TSV/CSV/SLOW5) directly |
 | `dragon migrate-paths` | Stream-convert a legacy `paths.bin` to the mmap-friendly format |
 
 Run `dragon <subcommand> --help` for the full option list.
@@ -252,7 +251,7 @@ QUERY (online, <4 GB RAM)
               ──► banded WFA alignment + path-walking ref extraction
               ──► PAF / BLAST6 / summary / gfa output
 
-SIGNAL SEARCH
+SIGNAL SEARCH  (experimental — not yet validated on real nanopore data)
   Raw nanopore pA ──► median-MAD normalise ──► 16-level discretise
                   ──► signal-FM-index backward search
                   ──► per-genome score ──► TSV
@@ -302,7 +301,7 @@ dragon/
 │   │   ├── containment.rs   K-mer containment ranking
 │   │   ├── direct_align.rs  Direct alignment to candidate genome subsequences
 │   │   └── mod.rs           Multi-shard orchestration
-│   ├── signal/              Raw-current nanopore search (signal-index, signal-search)
+│   ├── signal/              Raw-current nanopore search (experimental; signal-index, signal-search)
 │   ├── io/                  FASTA/FASTQ + PAF/BLAST6/GFA output
 │   ├── ds/                  Fenwick tree, Elias-Fano, varint codecs
 │   └── util/                DNA encoding, mmap, colorspace (SOLiD), progress
@@ -320,7 +319,7 @@ Benchmarks, manuscript, and AWS build scripts live in the companion repo `lcerde
 
 ## Citation
 
-> Cerdeira, L. (2026). Dragon: a cloud-native, signal-aware aligner for surveillance-scale microbial genomics. *In preparation.*
+> Cerdeira, L. (2026). Dragon: a cloud-native aligner for surveillance-scale microbial genomics. *In preparation.*
 
 ## Licence
 
