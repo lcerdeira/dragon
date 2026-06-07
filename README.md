@@ -120,7 +120,7 @@ Dragon detects GGCAT automatically. Without it, the built-in graph builder handl
 | `dragon summarize` | Produce a per-species prevalence/identity report from PAF output |
 | `dragon export-zarr` | Export an index as a Zarr v3 store (cloud-native, chunked) |
 | `dragon search-zarr` | Pattern-search a Zarr-backed index (local path or `s3://` URI) |
-| `dragon signal-index` | _(experimental, not validated on real data — see [#16](https://github.com/lcerdeira/dragon/issues/16))_ Build a signal-level index from FASTA via a pore model |
+| `dragon signal-index` | _(experimental, not validated on real data — see [#1](https://github.com/lcerdeira/dragon/issues/1))_ Build a signal-level index from FASTA via a pore model |
 | `dragon signal-search` | _(experimental, not validated on real data)_ Align raw nanopore current signals (TSV/CSV/SLOW5) directly |
 | `dragon migrate-paths` | Stream-convert a legacy `paths.bin` to the mmap-friendly format |
 
