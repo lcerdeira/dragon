@@ -178,20 +178,28 @@ dragon search -i gtdb/b1 --shard gtdb/b2 ... -q gene.fa --preset cross-species
 `dragon export-zarr` rewrites an index as a [Zarr v3](https://zarr.dev) store — chunked and Zstd-compressed — so it can be **queried directly from object storage without downloading the whole index**. The FM-index, colour bitmaps, and unitig text become chunked arrays; a query fetches only the chunks it touches via HTTP range requests, decompresses them on the fly (Zstd magic-byte sniffing, so mixed-codec stores work), and caches them per-query.
 
 ```bash
-# 1. Export a binary index to a Zarr store
+# 1. Export a binary index to a Zarr store (the local directory name is arbitrary)
 dragon export-zarr -i saureus/b1 -o saureus_b1.zarr
 
-# 2. Upload to your own bucket (public-read or credentialed)
-aws s3 cp --recursive saureus_b1.zarr s3://dragon-zarr/saureus/b1.zarr
+# 2. Upload to your own bucket (public-read or credentialed).
+#    The S3 prefix you upload to IS the path you query — it needs no .zarr suffix.
+aws s3 cp --recursive saureus_b1.zarr s3://dragon-zarr/saureus/b1
 
 # 3a. Query straight from S3 over HTTPS — nothing downloaded up front
 dragon search-zarr \
-    --zarr https://dragon-zarr.s3.eu-west-2.amazonaws.com/saureus/b1.zarr \
+    --zarr https://dragon-zarr.s3.eu-west-2.amazonaws.com/saureus/b1 \
     -q queries.fa -o hits.tsv
 
 # 3b. ...or with an s3:// URI / local path
-dragon search-zarr -z s3://dragon-zarr/saureus/b1.zarr -q queries.fa
+dragon search-zarr -z s3://dragon-zarr/saureus/b1 -q queries.fa
 ```
+
+> **⚠️ Path gotcha:** the `--zarr`/`-z` value is the store's exact prefix — whatever directory you uploaded — with **no enforced extension**. The public *S. aureus* demo lives at **`saureus/b1`** (no `.zarr`). Pointing at `saureus/b1.zarr` makes S3 return an XML 404, which surfaces as:
+> ```
+> Error: open HTTP Zarr index
+> Caused by: parse zarr.json: expected value at line 1 column 1
+> ```
+> If you see that, the path is wrong — drop (or add) the suffix so it matches the published prefix exactly. Quick check: `curl -s -o /dev/null -w '%{http_code}\n' <store-url>/zarr.json` should print `200`.
 
 The store is also readable by any Zarr-aware tool (zarr-python, xarray, s3fs) — see `scripts/zarr_demo.py`. This is what lets a laptop query a multi-terabyte database it could never hold locally: only the touched, compressed chunks cross the wire.
 
