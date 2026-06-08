@@ -1432,7 +1432,7 @@ echo "  Download complete."
                 Box::new(std::io::BufWriter::new(std::fs::File::create(&output)?))
             };
             use std::io::Write as _;
-            writeln!(writer, "query\tquery_len\tkmers_hit\tbest_genome\tbest_shared\tcontainment")?;
+            writeln!(writer, "query\tquery_len\tkmers_hit\tbest_genome\tbest_shared\tcontainment\tgenomes_at_best")?;
 
             // k-mer seeding containment search.
             //
@@ -1453,10 +1453,10 @@ echo "  Download complete."
                 mut kmer_positions: impl FnMut(&[u8]) -> anyhow::Result<Vec<u64>>,
                 mut pos_to_unitig: impl FnMut(u64) -> Option<(u32, u32)>,
                 mut colors_of: impl FnMut(u32) -> anyhow::Result<Vec<u32>>,
-            ) -> anyhow::Result<(usize, Option<(u32, usize)>)> {
+            ) -> anyhow::Result<(usize, Option<(u32, usize)>, usize)> {
                 use std::collections::HashMap;
                 if seq.len() < k {
-                    return Ok((0, None));
+                    return Ok((0, None, 0));
                 }
                 // Sample up to ~200 k-mers across the query (stride-based).
                 let total = seq.len() - k + 1;
@@ -1493,9 +1493,26 @@ echo "  Download complete."
                     }
                     p += stride;
                 }
-                let best = genome_hits.into_iter().max_by_key(|&(_, c)| c)
-                    .map(|(g, c)| (g, c));
-                Ok((kmers_hit, best))
+                // Deterministic best: highest shared count, ties broken by the
+                // smallest genome id (avoids run-to-run variation from HashMap's
+                // randomized iteration order). Also count how many genomes tie at
+                // that maximum — prevalence of the matched k-mer set.
+                let max_shared = genome_hits.values().copied().max();
+                let (best, genomes_at_best) = match max_shared {
+                    Some(mx) => {
+                        let mut best_g = u32::MAX;
+                        let mut n = 0usize;
+                        for (&g, &c) in &genome_hits {
+                            if c == mx {
+                                n += 1;
+                                if g < best_g { best_g = g; }
+                            }
+                        }
+                        (Some((best_g, mx)), n)
+                    }
+                    None => (None, 0usize),
+                };
+                Ok((kmers_hit, best, genomes_at_best))
             }
 
             if is_http {
@@ -1507,7 +1524,7 @@ echo "  Download complete."
                 );
                 let k = idx.kmer_size;
                 for rec in records {
-                    let (kmers_hit, best) = containment_over_zarr(
+                    let (kmers_hit, best, genomes_at_best) = containment_over_zarr(
                         &rec.seq, k,
                         |kmer| idx.search(kmer),
                         |pos| idx.position_to_unitig(pos),
@@ -1516,10 +1533,10 @@ echo "  Download complete."
                     match best {
                         Some((g, shared)) => {
                             let containment = shared as f64 / kmers_hit.max(1) as f64;
-                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}",
-                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment)?;
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment, genomes_at_best)?;
                         }
-                        None => writeln!(writer, "{}\t{}\t0\t\t\t0", rec.name, rec.seq.len())?,
+                        None => writeln!(writer, "{}\t{}\t0\t\t\t0\t0", rec.name, rec.seq.len())?,
                     }
                 }
             } else {
@@ -1531,7 +1548,7 @@ echo "  Download complete."
                 );
                 let k = fm.kmer_size;
                 for rec in records {
-                    let (kmers_hit, best) = containment_over_zarr(
+                    let (kmers_hit, best, genomes_at_best) = containment_over_zarr(
                         &rec.seq, k,
                         |kmer| fm.search(kmer),
                         |pos| fm.position_to_unitig(pos),
@@ -1540,10 +1557,10 @@ echo "  Download complete."
                     match best {
                         Some((g, shared)) => {
                             let containment = shared as f64 / kmers_hit.max(1) as f64;
-                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}",
-                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment)?;
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment, genomes_at_best)?;
                         }
-                        None => writeln!(writer, "{}\t{}\t0\t\t\t0", rec.name, rec.seq.len())?,
+                        None => writeln!(writer, "{}\t{}\t0\t\t\t0\t0", rec.name, rec.seq.len())?,
                     }
                 }
             }
