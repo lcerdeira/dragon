@@ -159,6 +159,18 @@ enum Commands {
         index: PathBuf,
     },
 
+    /// Dump genome names (from the path index) as a JSON array. Used to retrofit
+    /// `genome_names` into an existing Zarr store's zarr.json without a full
+    /// re-export — loads only paths.bin (no fm-index / suffix array).
+    DumpNames {
+        /// Path to the Dragon index directory
+        #[arg(short, long)]
+        index: PathBuf,
+        /// Output JSON file ("-" for stdout)
+        #[arg(short, long, default_value = "-")]
+        output: String,
+    },
+
     /// Build a signal-level index from genome FASTA files for nanopore signal search
     SignalIndex {
         /// Directory containing genome FASTA files (.fa, .fasta, .fna)
@@ -622,6 +634,23 @@ fn main() -> Result<()> {
                 results.len(),
                 results.iter().map(|r| r.alignments.len()).sum::<usize>()
             );
+        }
+
+        Commands::DumpNames { index, output } => {
+            let pidx = dragon::index::paths::load_path_index(&index)
+                .context("load path index (paths.bin)")?;
+            let n = pidx.num_genomes();
+            let mut names: Vec<String> = Vec::with_capacity(n);
+            for gid in 0..n as u32 {
+                names.push(pidx.genome_meta(gid).map(|(name, _)| name).unwrap_or_default());
+            }
+            let json = serde_json::to_string(&names)?;
+            if output == "-" {
+                println!("{json}");
+            } else {
+                std::fs::write(&output, &json)?;
+            }
+            log::info!("dumped {} genome names to {}", names.len(), output);
         }
 
         Commands::Info { index } => {
