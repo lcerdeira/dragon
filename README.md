@@ -203,7 +203,28 @@ dragon search-zarr -z s3://dragon-zarr/saureus/b1 -q queries.fa
 
 The store is also readable by any Zarr-aware tool (zarr-python, xarray, s3fs) — see `scripts/zarr_demo.py`. This is what lets a laptop query a multi-terabyte database it could never hold locally: only the touched, compressed chunks cross the wire.
 
-> `search-zarr` reports matching text positions + unitig IDs (cloud-native seed discovery). For full base-level alignment, run `dragon search` against a binary index (local or downloaded).
+### `search-zarr` output (containment / prevalence)
+
+`search-zarr` is a cloud-native **containment** scan: it reports which indexed genomes contain the query's k-mers and how widely — not a base-level alignment. One tab-separated row per query:
+
+| Column | Meaning |
+|---|---|
+| `query` | query sequence ID |
+| `query_len` | query length (bp) |
+| `kmers_hit` | sampled query k-mers with ≥1 match in the index |
+| `best_genome` | internal id of the top genome (ties broken deterministically by smallest id, so runs are reproducible) |
+| `best_genome_name` | accession/name of that genome (empty if the store predates name export) |
+| `best_shared` | k-mers shared with the best genome |
+| `containment` | `best_shared / kmers_hit` |
+| `genomes_at_best` | genomes tied at the maximum — i.e. carrying the full matched k-mer set (**prevalence** of the query) |
+| `genomes_hit` | total genomes containing ≥1 query k-mer (breadth) |
+
+```
+query    query_len  kmers_hit  best_genome  best_genome_name  best_shared  containment  genomes_at_best  genomes_hit
+ermC_LP  59         11         1            SAMD00006357      11           1.0000       2462             2505
+```
+
+> For base-level alignment — identity, coordinates, CIGAR, e-value/bitscore, comparable to LexicMap/BLAST — run `dragon search --format blast6` (or `paf`) against a **binary** index (local or downloaded), not `search-zarr`. `search-zarr` answers *"which genomes contain this, and how common is it?"*; `dragon search` answers *"where exactly, and how similar?"*.
 
 ## Pre-built indices
 
