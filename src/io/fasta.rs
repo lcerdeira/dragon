@@ -87,9 +87,15 @@ pub fn read_sequences(path: &Path) -> Result<Vec<Sequence>> {
             // FASTQ quality header - skip next line
             continue;
         } else {
-            // Filter to only valid DNA bases (strip GGCAT's trailing '$' and other non-DNA chars)
+            // Filter to valid DNA bases (strip GGCAT's trailing '$' and other non-DNA
+            // chars) and upper-case them, so case-insensitive matching works: many
+            // reference DBs (VFDB, AMRFinderPlus, soft-masked RefSeq) are lower/mixed
+            // case, and the FM-index text is upper-case — without folding, a lowercase
+            // query silently returns zero hits.
             current_seq.extend(
-                line.bytes().filter(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't' | b'N' | b'n'))
+                line.bytes()
+                    .filter(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't' | b'N' | b'n'))
+                    .map(|b| b.to_ascii_uppercase())
             );
         }
     }
@@ -157,7 +163,8 @@ impl Iterator for FastaReader {
                         );
                         break;
                     }
-                    seq.extend_from_slice(line.as_bytes());
+                    // Upper-case for case-insensitive matching (see read_sequences).
+                    seq.extend(line.bytes().map(|b| b.to_ascii_uppercase()));
                 }
                 Err(e) => return Some(Err(e.into())),
             }
