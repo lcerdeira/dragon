@@ -58,6 +58,9 @@ pub struct HttpZarrIndex {
     pub kmer_size: usize,
     pub text_len: u64,
     pub sa_len: u64,
+    /// Optional genome names (root attribute `genome_names`), indexed by genome id.
+    /// Empty if the store predates name export.
+    pub genome_names: Vec<String>,
     /// Cumulative unitig lengths — maps text positions to (unitig_id, offset).
     pub cumulative_lengths: CumulativeLengthIndex,
     /// Total entries in /colors/offsets (= num_unitigs + 1).
@@ -121,6 +124,10 @@ impl HttpZarrIndex {
         let num_genomes = attrs["num_genomes"].as_u64().unwrap_or(0);
         let text_len = attrs["text_len"].as_u64().unwrap_or(0);
         let sa_len = attrs["num_suffixes"].as_u64().unwrap_or(0);
+        let genome_names: Vec<String> = attrs["genome_names"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
 
         // ── Array metadata (chunk sizes) ──────────────────────────────────
         let sa_meta: ZarrArrayMeta = client
@@ -171,6 +178,7 @@ impl HttpZarrIndex {
             kmer_size,
             text_len,
             sa_len,
+            genome_names,
             cumulative_lengths,
             color_offsets_len: num_unitigs + 1,
             sa_chunk_size,

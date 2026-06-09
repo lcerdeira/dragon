@@ -96,6 +96,29 @@ pub fn export_to_zarr(index_dir: &Path, zarr_path: &Path) -> Result<ExportStats>
     attrs.insert("num_genomes".into(), serde_json::json!(num_genomes));
     attrs.insert("text_len".into(), serde_json::json!(text_len));
     attrs.insert("num_suffixes".into(), serde_json::json!(sa_len));
+    // Genome names for accession-level reporting in search-zarr. Sourced from the
+    // path index — the same loader the binary `dragon search` uses — so the cloud
+    // store carries real genome names instead of bare integer ids. Stored as a
+    // root attribute, so it rides along with the existing metadata fetch (no extra
+    // HTTP requests at query time).
+    match crate::index::paths::load_path_index(index_dir) {
+        Ok(pidx) => {
+            let mut names: Vec<String> = Vec::with_capacity(num_genomes as usize);
+            for gid in 0..num_genomes as u32 {
+                match pidx.genome_meta(gid) {
+                    Some((name, _len)) => names.push(name),
+                    None => { names.clear(); break; }
+                }
+            }
+            if names.len() == num_genomes as usize {
+                attrs.insert("genome_names".into(), serde_json::json!(names));
+                log::info!("exported {} genome names to store attributes", names.len());
+            } else {
+                log::warn!("genome names incomplete; store will report integer ids only");
+            }
+        }
+        Err(e) => log::warn!("path index unavailable ({e}); store reports integer ids only"),
+    }
     root.store_metadata()?;
 
     // /text: concatenated unitig text, u8 with Zstd.
@@ -383,6 +406,8 @@ pub struct ZarrFmIndex {
     pub kmer_size: usize,
     pub num_unitigs: u64,
     pub num_genomes: u64,
+    /// Optional genome names (root attribute `genome_names`), indexed by genome id.
+    pub genome_names: Vec<String>,
 }
 
 impl ZarrFmIndex {
@@ -416,10 +441,14 @@ impl ZarrFmIndex {
             .and_then(|v| v.as_u64()).unwrap_or(lengths.len() as u64);
         let num_genomes = attrs.get("num_genomes")
             .and_then(|v| v.as_u64()).unwrap_or(0);
+        let genome_names: Vec<String> = attrs.get("genome_names")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
 
         Ok(Self {
             text, sa, cumulative_lengths,
-            text_len, sa_len, kmer_size, num_unitigs, num_genomes,
+            text_len, sa_len, kmer_size, num_unitigs, num_genomes, genome_names,
         })
     }
 

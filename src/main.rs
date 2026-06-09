@@ -1432,7 +1432,7 @@ echo "  Download complete."
                 Box::new(std::io::BufWriter::new(std::fs::File::create(&output)?))
             };
             use std::io::Write as _;
-            writeln!(writer, "query\tquery_len\tkmers_hit\tbest_genome\tbest_shared\tcontainment\tgenomes_at_best")?;
+            writeln!(writer, "query\tquery_len\tkmers_hit\tbest_genome\tbest_genome_name\tbest_shared\tcontainment\tgenomes_at_best\tgenomes_hit")?;
 
             // k-mer seeding containment search.
             //
@@ -1453,10 +1453,10 @@ echo "  Download complete."
                 mut kmer_positions: impl FnMut(&[u8]) -> anyhow::Result<Vec<u64>>,
                 mut pos_to_unitig: impl FnMut(u64) -> Option<(u32, u32)>,
                 mut colors_of: impl FnMut(u32) -> anyhow::Result<Vec<u32>>,
-            ) -> anyhow::Result<(usize, Option<(u32, usize)>, usize)> {
+            ) -> anyhow::Result<(usize, Option<(u32, usize)>, usize, usize)> {
                 use std::collections::HashMap;
                 if seq.len() < k {
-                    return Ok((0, None, 0));
+                    return Ok((0, None, 0, 0));
                 }
                 // Sample up to ~200 k-mers across the query (stride-based).
                 let total = seq.len() - k + 1;
@@ -1512,7 +1512,8 @@ echo "  Download complete."
                     }
                     None => (None, 0usize),
                 };
-                Ok((kmers_hit, best, genomes_at_best))
+                let genomes_hit = genome_hits.len();
+                Ok((kmers_hit, best, genomes_at_best, genomes_hit))
             }
 
             if is_http {
@@ -1523,8 +1524,9 @@ echo "  Download complete."
                     idx.num_unitigs, idx.num_genomes, idx.kmer_size, idx.sa_len
                 );
                 let k = idx.kmer_size;
+                let names = &idx.genome_names;
                 for rec in records {
-                    let (kmers_hit, best, genomes_at_best) = containment_over_zarr(
+                    let (kmers_hit, best, genomes_at_best, genomes_hit) = containment_over_zarr(
                         &rec.seq, k,
                         |kmer| idx.search(kmer),
                         |pos| idx.position_to_unitig(pos),
@@ -1533,10 +1535,11 @@ echo "  Download complete."
                     match best {
                         Some((g, shared)) => {
                             let containment = shared as f64 / kmers_hit.max(1) as f64;
-                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
-                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment, genomes_at_best)?;
+                            let gname = names.get(g as usize).map(String::as_str).unwrap_or("");
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
+                                rec.name, rec.seq.len(), kmers_hit, g, gname, shared, containment, genomes_at_best, genomes_hit)?;
                         }
-                        None => writeln!(writer, "{}\t{}\t0\t\t\t0\t0", rec.name, rec.seq.len())?,
+                        None => writeln!(writer, "{}\t{}\t0\t\t\t\t0\t0\t0", rec.name, rec.seq.len())?,
                     }
                 }
             } else {
@@ -1547,8 +1550,9 @@ echo "  Download complete."
                     fm.num_unitigs, fm.num_genomes, fm.kmer_size, fm.text_len
                 );
                 let k = fm.kmer_size;
+                let names = &fm.genome_names;
                 for rec in records {
-                    let (kmers_hit, best, genomes_at_best) = containment_over_zarr(
+                    let (kmers_hit, best, genomes_at_best, genomes_hit) = containment_over_zarr(
                         &rec.seq, k,
                         |kmer| fm.search(kmer),
                         |pos| fm.position_to_unitig(pos),
@@ -1557,10 +1561,11 @@ echo "  Download complete."
                     match best {
                         Some((g, shared)) => {
                             let containment = shared as f64 / kmers_hit.max(1) as f64;
-                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
-                                rec.name, rec.seq.len(), kmers_hit, g, shared, containment, genomes_at_best)?;
+                            let gname = names.get(g as usize).map(String::as_str).unwrap_or("");
+                            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
+                                rec.name, rec.seq.len(), kmers_hit, g, gname, shared, containment, genomes_at_best, genomes_hit)?;
                         }
-                        None => writeln!(writer, "{}\t{}\t0\t\t\t0\t0", rec.name, rec.seq.len())?,
+                        None => writeln!(writer, "{}\t{}\t0\t\t\t\t0\t0\t0", rec.name, rec.seq.len())?,
                     }
                 }
             }
