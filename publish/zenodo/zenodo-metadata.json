@@ -1,0 +1,39 @@
+{
+  "_comment": "Zenodo deposition metadata. Upload via the Zenodo REST API (POST /api/deposit/depositions with this under {\"metadata\": ...}) or paste fields into the web form. Only ORCIDs and the related preprint DOI remain as placeholders. The Zenodo record holds: the DOI (citation), the small reference-DB indexes (AMRFinderPlus/CARD/VFDB/PlasmidFinder, each well under 50 GB), and this MANIFEST + README pointing to the large indexes on S3.",
+  "metadata": {
+    "upload_type": "dataset",
+    "title": "Dragon Indexes for AllTheBacteria and bacterial reference databases",
+    "version": "v0.1",
+    "language": "eng",
+    "access_right": "open",
+    "license": "cc-by-4.0",
+    "description": "<p>Prebuilt, cloud-native (Zarr) sequence-search indexes produced by <strong>Dragon</strong>, enabling sub-second alignment of query sequences against millions of bacterial genomes and curated AMR/virulence/plasmid gene catalogues.</p><p>The large genome-collection indexes (AllTheBacteria — 2,292,989 assemblies, 8.1 TB; GTDB; E. coli; K. pneumoniae; S. aureus; Shigella; Salmonella enterica; Salmonella Typhi) are hosted on AWS S3 (<code>s3://dragon-zarr</code>, region eu-west-2) via the AWS Open Data Program because they exceed repository size limits (projected total ~12 TB). This Zenodo record provides the citable DOI, the small reference-database indexes (AMRFinderPlus, CARD, VFDB, PlasmidFinder), and the manifest/README with S3 URIs, sizes, checksums, and usage.</p><p>Format: Zarr (chunked) — tools stream only the chunks needed, so a single-gene query never downloads the full index.</p><p><strong>Note on CARD:</strong> the CARD database has restricted redistribution; the CARD-derived index here ships derived metadata only / may be omitted — obtain CARD from card.mcmaster.ca.</p>",
+    "keywords": [
+      "bacterial genomics",
+      "sequence search",
+      "AllTheBacteria",
+      "antimicrobial resistance",
+      "AMRFinderPlus",
+      "virulence factors",
+      "plasmids",
+      "GTDB",
+      "Zarr",
+      "cloud-native",
+      "metagenomics"
+    ],
+    "creators": [
+      { "name": "Cerdeira, Louise", "affiliation": "London School of Hygiene & Tropical Medicine", "orcid": "0000-0002-4495-2615" },
+      { "name": "Holt, Kathryn E.", "affiliation": "London School of Hygiene & Tropical Medicine", "orcid": "0000-0003-3949-2471" }
+    ],
+    "contributors": [
+      { "name": "Cerdeira, Louise", "type": "ContactPerson", "affiliation": "London School of Hygiene & Tropical Medicine" }
+    ],
+    "related_identifiers": [
+      { "relation": "isSupplementTo", "identifier": "«arXiv/bioRxiv DOI of the Dragon paper»", "resource_type": "publication-preprint" },
+      { "relation": "isDerivedFrom", "identifier": "10.1101/2024.03.08.584059", "resource_type": "publication-preprint", "_comment": "AllTheBacteria preprint" },
+      { "relation": "isSupplementedBy", "identifier": "https://github.com/lcerdeira/dragon", "resource_type": "software" },
+      { "relation": "references", "identifier": "https://registry.opendata.aws/«dragon-indexes»", "resource_type": "dataset", "_comment": "AWS Open Data registry entry (large indexes)" }
+    ],
+    "notes": "Large indexes (>50 GB) are not uploaded to Zenodo; they live in s3://dragon-zarr (AWS Open Data Program). See MANIFEST.md for the full catalogue, byte sizes, object counts, and SHA256 checksums. Managed by London School of Hygiene & Tropical Medicine (LSHTM)."
+  }
+}

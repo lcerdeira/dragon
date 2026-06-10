@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Dragon Contributors"]
 description = "Resource-efficient sequence alignment against millions of prokaryotic genomes"
-license = "MIT"
-repository = "https://github.com/dragon-aligner/dragon"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lcerdeira/dragon"
 
 [dependencies]
 # Core bioinformatics

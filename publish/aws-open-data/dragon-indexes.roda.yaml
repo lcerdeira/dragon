@@ -1,0 +1,51 @@
+--- # Registry of Open Data on AWS — entry
+# PR this file into https://github.com/awslabs/open-data-registry/ (dir: datasets/)
+# after the sponsorship is approved. Validate against the repo's schema before submitting.
+# Remaining placeholder: the Zenodo DOI (reserve it, then fill in DataAtWork.Publications).
+
+Name: Dragon Indexes for AllTheBacteria and bacterial reference databases
+Description: >-
+  Prebuilt, cloud-native (Zarr) sequence-search indexes produced by Dragon, enabling
+  sub-second alignment of query sequences against millions of bacterial genomes and curated
+  AMR/virulence/plasmid gene catalogues. Includes the full AllTheBacteria corpus
+  (2,292,989 assemblies, 8.1 TB, 1,147 shards), per-species indexes (E. coli, K. pneumoniae,
+  S. aureus, Shigella, Salmonella enterica, Salmonella Typhi), a GTDB index, and
+  reference-database indexes (AMRFinderPlus, CARD, VFDB, PlasmidFinder). Zarr chunking lets
+  tools stream only the bytes they need, so a single-gene query never downloads the whole index.
+Documentation: https://github.com/lcerdeira/dragon/blob/main/publish/README.md
+Contact: Louise Cerdeira <louise.teixeira-cerdeira@lshtm.ac.uk>
+ManagedBy: "[London School of Hygiene & Tropical Medicine (LSHTM)](https://www.lshtm.ac.uk/)"
+UpdateFrequency: Updated on each new AllTheBacteria and GTDB release, and as new indexes are built.
+Tags:
+  - aws-pds
+  - bioinformatics
+  - genomic
+  - genetic
+  - life sciences
+  - microbiome
+  - antimicrobial resistance
+  - whole genome sequencing
+License: >-
+  Indexes released under CC-BY-4.0. Underlying data retains source licenses
+  (AllTheBacteria/INSDC, GTDB, NCBI AMRFinderPlus, VFDB, PlasmidFinder). CARD redistribution
+  is restricted; see dataset documentation.
+Resources:
+  - Description: Dragon Zarr indexes (genome collections + reference DBs)
+    ARN: arn:aws:s3:::dragon-zarr
+    Region: eu-west-2
+    Type: S3 Bucket
+DataAtWork:
+  Tutorials:
+    - Title: "Quickstart: searching AllTheBacteria with Dragon"
+      URL: https://github.com/lcerdeira/dragon/blob/main/publish/README.md#quickstart-local
+      AuthorName: Louise Cerdeira
+      AuthorURL: https://github.com/lcerdeira
+  Tools & Applications:
+    - Title: Dragon — cloud-native sequence search
+      URL: https://github.com/lcerdeira/dragon
+      AuthorName: Louise Cerdeira
+      AuthorURL: https://github.com/lcerdeira
+  Publications:
+    - Title: "Dragon: cloud-native sequence search across millions of bacterial genomes"
+      URL: https://doi.org/«10.5281/zenodo.XXXXXXX»
+      AuthorName: Louise Cerdeira, Kathryn Holt

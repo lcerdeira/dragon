@@ -1,0 +1,31 @@
+Dragon Indexes — Data License
+==============================
+
+The Dragon indexes published under this directory (the "Indexes") are licensed under the
+Creative Commons Attribution 4.0 International License (CC-BY-4.0).
+
+    SPDX-License-Identifier: CC-BY-4.0
+    Full legal code:  https://creativecommons.org/licenses/by/4.0/legalcode
+    Summary (deed):   https://creativecommons.org/licenses/by/4.0/
+
+Required attribution
+--------------------
+When you use, share, or adapt the Indexes, credit:
+
+    Cerdeira L, Holt KE. "Dragon Indexes for AllTheBacteria and bacterial reference
+    databases." London School of Hygiene & Tropical Medicine, 2026.
+    DOI: «10.5281/zenodo.XXXXXXX»
+
+Scope and carve-outs
+--------------------
+* This CC-BY-4.0 license applies to the INDEX DATA only. The Dragon SOFTWARE is licensed
+  separately (MIT OR Apache-2.0) — see the repository root.
+* The Indexes are derived from third-party source databases that retain their own licenses.
+  See NOTICE.md for per-source attribution and terms.
+* NOT all reference databases are redistributed here. In particular CARD (and, pending
+  confirmation, VFDB) are NOT included due to their usage terms — build those indexes
+  locally with the scripts in `scripts/`. See NOTICE.md.
+
+CC-BY-4.0 is offered for the components we are entitled to redistribute (AllTheBacteria/
+INSDC-derived genome indexes, GTDB, the per-species indexes, AMRFinderPlus, PlasmidFinder).
+It permits commercial and clinical use, requiring only attribution.

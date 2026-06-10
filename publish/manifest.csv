@@ -1,0 +1,13 @@
+index,type,genomes_or_records,s3_uri,region,objects,size_bytes,size_human,build_dragon_version,kmer,sha256sums,license,redistribution,status
+atb,genome_collection,2292989,s3://dragon-zarr/atb/,eu-west-2,9999899,8099470677679,8.1TB,TBD,31,TBD,cc-by-4.0,yes,published
+gtdb,genome_collection,TBD,s3://dragon-zarr/gtdb_batch1.zarr,eu-west-2,32749,19136407977,19.1GB,TBD,31,TBD,cc-by-4.0,yes,partial
+kpneumo,genome_collection,TBD,s3://dragon-zarr/kpneumo/b1,eu-west-2,27082,6898920254,6.9GB,TBD,31,TBD,cc-by-4.0,yes,partial
+saureus,genome_collection,TBD,s3://dragon-zarr/saureus/,eu-west-2,13669,2019940073,2.0GB,TBD,31,TBD,cc-by-4.0,yes,partial
+ecoli,genome_collection,364000,s3://dragon-zarr/ecoli/,eu-west-2,0,0,building,TBD,31,TBD,cc-by-4.0,yes,building
+shigella,genome_collection,TBD,s3://dragon-zarr/shigella/,eu-west-2,0,0,planned,TBD,31,TBD,cc-by-4.0,yes,planned
+salmonella_enterica,genome_collection,TBD,s3://dragon-zarr/salmonella_enterica/,eu-west-2,0,0,planned,TBD,31,TBD,cc-by-4.0,yes,planned
+salmonella_typhi,genome_collection,TBD,s3://dragon-zarr/salmonella_typhi/,eu-west-2,0,0,planned,TBD,31,TBD,cc-by-4.0,yes,planned
+amrfinderplus,reference_db,2440377,s3://dragon-zarr/amrfinderplus.parquet,eu-west-2,1,84934656,81MB,TBD,NA,TBD,cc-by-4.0,yes,external
+plasmidfinder,reference_db,TBD,s3://dragon-zarr/plasmidfinder/,eu-west-2,0,0,planned,TBD,31,TBD,cc-by-4.0,yes,planned
+vfdb,reference_db,TBD,LOCAL-build (scripts/build_vfdb_index.sh),eu-west-2,0,0,build-locally,TBD,31,NA,academic-see-NOTICE,no-pending,build-locally
+card,reference_db,TBD,LOCAL-build (scripts/build_card_index.sh),eu-west-2,0,0,build-locally,TBD,31,NA,RESTRICTED-CARD-DUA,no,build-locally
