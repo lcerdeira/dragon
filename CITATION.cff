@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use Dragon, please cite it using the metadata below."
+title: "Dragon: a cloud-native aligner for surveillance-scale microbial genomics"
+abstract: "Resource-efficient sequence alignment against millions of prokaryotic genomes."
+type: software
+version: "0.1.0"
+repository-code: "https://github.com/lcerdeira/dragon"
+license:
+  - MIT
+  - Apache-2.0
+authors:
+  - family-names: Cerdeira
+    given-names: Louise
+    orcid: "https://orcid.org/0000-0002-4495-2615"
+    affiliation: "London School of Hygiene & Tropical Medicine"
+  - family-names: Holt
+    given-names: "Kathryn E."
+    orcid: "https://orcid.org/0000-0003-3949-2471"
+    affiliation: "London School of Hygiene & Tropical Medicine"
+keywords:
+  - bioinformatics
+  - sequence alignment
+  - microbial genomics
+  - antimicrobial resistance
+  - AllTheBacteria
