@@ -535,7 +535,8 @@ fn test_blast_tabular_output() {
     }];
 
     let mut buf = Vec::new();
-    dragon::io::blast::write_blast_tabular(&mut buf, &records).unwrap();
+    // db_size for the E-value; header=false → bare outfmt6.
+    dragon::io::blast::write_blast_tabular(&mut buf, &records, 3000, false).unwrap();
     let output = String::from_utf8(buf).unwrap();
 
     let fields: Vec<&str> = output.trim().split('\t').collect();
@@ -543,6 +544,10 @@ fn test_blast_tabular_output() {
     assert_eq!(fields[1], "g1");
     // Identity should be 96.00
     assert!(fields[2].starts_with("96.0"));
+    // 12 BLAST columns; E-value and bit-score are finite (raw score > 0).
+    assert_eq!(fields.len(), 12);
+    let bitscore: f64 = fields[11].parse().unwrap();
+    assert!(bitscore > 0.0);
 }
 
 // ============================================================================
