@@ -210,24 +210,57 @@ fn align_with_seeds(
         return None;
     }
 
-    // Cluster anchors around the median ref_position to avoid one rogue seed
-    // (that mapped to a duplicated region elsewhere in the genome) blowing
-    // the alignment window up to megabases. WFA on 59 bp × 2.8 Mb allocates
-    // O(s · n) cells = many GB and OOMs the process.
+    // Partition anchors into co-linear fragments and keep the dominant one.
     //
-    // Keep only anchors within MAX_CLUSTER_SPAN bp of the median; if that
-    // cluster is too tight or empty, fall back to a window centred on the
-    // median. Bounds the extracted reference to (3 · query.len() + 2 · pad).
-    let max_cluster_span: u64 = (query.len() as u64 * 3).max(500);
-    anchors.sort_by_key(|a| a.0);
-    let median_pos = anchors[anchors.len() / 2].0;
-    let half_span = max_cluster_span / 2;
-    let cluster_lo = median_pos.saturating_sub(half_span);
-    let cluster_hi = median_pos.saturating_add(half_span);
-    anchors.retain(|(p, _, _)| *p >= cluster_lo && *p <= cluster_hi);
+    // A gene split across two contigs (common in fragmented draft assemblies)
+    // produces two anchor groups on different diagonals (genome_pos −
+    // query_pos). The old single median±span window then spanned both
+    // fragments plus the unrelated sequence between them, so WFA aligned the
+    // query against a chimeric reference — it matched one fragment then
+    // produced garbage (e.g. clbB: 1018 bp perfect, then 58 % overall). We
+    // group anchors by diagonal and align the fragment that covers the most
+    // query, recovering the dominant gene portion. BLAST reports the same via
+    // its best HSP.
+    //
+    // Sparse seeds on a single contiguous gene share one diagonal (genome and
+    // query advance together), so they remain one group — preserving the
+    // full-query alignment behaviour for that case. This also bounds the
+    // window (one fragment ≈ one query length), avoiding the megabase windows
+    // that a rogue duplicated-region seed would otherwise create.
+    anchors.sort_by_key(|a| (a.0 as i64 - a.1 as i64, a.1)); // by diagonal, then query
+    let diag_tol: i64 = (query.len() as i64 / 10).max(200);
+    let qspan = |g: &[(u64, usize, usize)]| -> usize {
+        if g.is_empty() {
+            return 0;
+        }
+        let lo = g.iter().map(|a| a.1).min().unwrap();
+        let hi = g.iter().map(|(_, q, ml)| q + ml).max().unwrap();
+        hi.saturating_sub(lo)
+    };
+    let mut best_frag: Vec<(u64, usize, usize)> = Vec::new();
+    let mut cur_frag: Vec<(u64, usize, usize)> = Vec::new();
+    let mut last_diag: Option<i64> = None;
+    for a in &anchors {
+        let d = a.0 as i64 - a.1 as i64;
+        if let Some(ld) = last_diag {
+            if (d - ld).abs() > diag_tol {
+                if qspan(&cur_frag) > qspan(&best_frag) {
+                    best_frag = cur_frag.clone();
+                }
+                cur_frag.clear();
+            }
+        }
+        cur_frag.push(*a);
+        last_diag = Some(d);
+    }
+    if qspan(&cur_frag) > qspan(&best_frag) {
+        best_frag = cur_frag;
+    }
+    anchors = best_frag;
     if anchors.is_empty() {
         return None;
     }
+    anchors.sort_by_key(|a| a.0);
 
     let ref_min = anchors.iter().map(|a| a.0).min().unwrap();
     let ref_max = anchors
@@ -480,18 +513,20 @@ fn align_with_seeds(
     let q_lead_gap = leading_gap_consumed(&alignment.text_aligned, &alignment.query_aligned);
     let q_aligned_len = stats.query_consumed;
     let _ = query_min_in_align; // placeholder; full query is always 0..query.len()
+    // Clamp to [0, L] so a reverse-strand alignment with a leading text-side
+    // gap (where q_lead_gap can already be counted in query_consumed) cannot
+    // underflow `l - b` (panic in debug / wrap in release) or push the forward
+    // query_end past the query length.
+    let l = q_str.len();
     let (final_q_start, final_q_end) = if is_reverse {
         // We aligned RC(query) against t.
-        // Map back: a RC slice's [a, b) corresponds to original [L-b, L-a)
-        // where L = q_str.len().
-        let l = q_str.len();
-        let a = q_lead_gap;
-        let b = a + q_aligned_len;
-        let rc_start = l - b;
-        let rc_end = l - a;
-        (rc_start, rc_end)
+        // Map back: a RC slice's [a, b) corresponds to original [L-b, L-a).
+        let a = q_lead_gap.min(l);
+        let b = (a + q_aligned_len).min(l);
+        (l - b, l - a)
     } else {
-        (q_lead_gap, q_lead_gap + q_aligned_len)
+        let a = q_lead_gap.min(l);
+        (a, (a + q_aligned_len).min(l))
     };
 
     let alignment_len = stats.alignment_len;

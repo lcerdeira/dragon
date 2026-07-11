@@ -68,7 +68,7 @@ enum Commands {
         #[arg(short, long, default_value = "-")]
         output: String,
 
-        /// Output format: paf, blast6, summary, or gfa
+        /// Output format: paf, blast6 (BLAST outfmt 6), blast7 (outfmt 7, with header), summary, or gfa
         #[arg(short, long, default_value = "paf")]
         format: String,
 
@@ -400,6 +400,11 @@ enum Commands {
         /// Output TSV path (use "-" for stdout)
         #[arg(short, long, default_value = "-")]
         output: String,
+
+        /// Output: containment (default, k-mer pre-filter) or blast6/blast7
+        /// (full WFA alignment — requires /paths in the store; local store only for now)
+        #[arg(short, long, default_value = "containment")]
+        format: String,
     },
 
     /// Migrate a legacy bincode `paths.bin` to the mmap-friendly v2 format.
@@ -588,7 +593,23 @@ fn main() -> Result<()> {
             // Load path and color indices for summary/gfa modes (lazy)
             let _need_indices = matches!(format.as_str(), "summary" | "gfa");
 
-            for result in &results {
+            // Effective database size for BLAST E-values: total searched bases
+            // (sum of total_unitig_bases across the primary index and all shards).
+            let blast_db_size: u64 = if matches!(format.as_str(), "blast6" | "blast" | "blast7") {
+                let mut total = dragon::index::metadata::load_metadata(&index)
+                    .map(|m| m.total_unitig_bases)
+                    .unwrap_or(0);
+                for s in &shard {
+                    total += dragon::index::metadata::load_metadata(s)
+                        .map(|m| m.total_unitig_bases)
+                        .unwrap_or(0);
+                }
+                total
+            } else {
+                0
+            };
+
+            for (result_idx, result) in results.iter().enumerate() {
                 let mut records = result.alignments.clone();
                 for record in &mut records {
                     record.query_name = result.query_name.clone();
@@ -596,7 +617,8 @@ fn main() -> Result<()> {
 
                 match format.as_str() {
                     "paf" => dragon::io::paf::write_paf(&mut writer, &records)?,
-                    "blast6" => dragon::io::blast::write_blast_tabular(&mut writer, &records)?,
+                    "blast6" => dragon::io::blast::write_blast_tabular(&mut writer, &records, blast_db_size, false)?,
+                    "blast" | "blast7" => dragon::io::blast::write_blast_tabular(&mut writer, &records, blast_db_size, result_idx == 0)?,
                     "summary" => {
                         // Load metadata to get total genome count
                         let metadata = dragon::index::metadata::load_metadata(&index)?;
@@ -625,7 +647,7 @@ fn main() -> Result<()> {
                         );
                         dragon::io::graph_context::write_gfa(&mut writer, &subgraphs)?;
                     }
-                    _ => anyhow::bail!("Unknown output format: {}. Use paf, blast6, summary, or gfa", format),
+                    _ => anyhow::bail!("Unknown output format: {}. Use paf, blast6, blast7, summary, or gfa", format),
                 }
             }
 
@@ -1443,7 +1465,7 @@ echo "  Download complete."
             }
         }
 
-        Commands::SearchZarr { zarr, query, output } => {
+        Commands::SearchZarr { zarr, query, output, format } => {
             // Dispatch on URL scheme: http(s):// → lazy HTTP reader; else filesystem.
             let zarr_str = zarr.to_string_lossy();
             let is_http = zarr_str.starts_with("http://") || zarr_str.starts_with("https://");
@@ -1461,6 +1483,34 @@ echo "  Download complete."
                 Box::new(std::io::BufWriter::new(std::fs::File::create(&output)?))
             };
             use std::io::Write as _;
+
+            // ── BLAST output: full WFA alignment, reusing the binary-index aligner ──
+            // (search-zarr -f blast6/blast7). Reference is sourced from the Zarr's
+            // /paths; local store only for now (HTTP-lazy alignment is pending).
+            if matches!(format.as_str(), "blast6" | "blast7" | "blast") {
+                if is_http {
+                    anyhow::bail!(
+                        "search-zarr -f {format} (full alignment) needs a local Zarr store with \
+                         /paths; HTTP-lazy alignment is not yet implemented — download the store, \
+                         or use the default containment output over HTTP."
+                    );
+                }
+                let aref = dragon::query::zarr_align::load_zarr_ref(&zarr)?;
+                let want_header = format != "blast6";
+                let mut first = true;
+                for rec in &records {
+                    let paf = dragon::query::zarr_align::align_query(
+                        &aref, &rec.seq, &rec.name, 0, 10_000, 0.7, 0.3,
+                    )?;
+                    dragon::io::blast::write_blast_tabular(
+                        &mut writer, &paf, aref.db_size, want_header && first,
+                    )?;
+                    first = false;
+                }
+                log::info!("search-zarr blast: aligned {} queries", records.len());
+                return Ok(());
+            }
+
             writeln!(writer, "query\tquery_len\tkmers_hit\tbest_genome\tbest_genome_name\tbest_shared\tcontainment\tgenomes_at_best\tgenomes_hit")?;
 
             // k-mer seeding containment search.
@@ -1510,13 +1560,21 @@ echo "  Download complete."
                                     distinct.insert(uid);
                                 }
                             }
+                            // Credit each genome at most once per k-mer: a genome
+                            // may appear in several unitigs this k-mer maps to, and
+                            // without dedup `shared` can exceed `kmers_hit`, making
+                            // the reported containment exceed 1.0.
+                            let mut genomes_this_kmer = std::collections::HashSet::new();
                             for uid in distinct {
                                 if !seen_unitig_colors.contains_key(&uid) {
                                     seen_unitig_colors.insert(uid, colors_of(uid)?);
                                 }
                                 for &g in &seen_unitig_colors[&uid] {
-                                    *genome_hits.entry(g).or_insert(0) += 1;
+                                    genomes_this_kmer.insert(g);
                                 }
+                            }
+                            for g in genomes_this_kmer {
+                                *genome_hits.entry(g).or_insert(0) += 1;
                             }
                         }
                     }

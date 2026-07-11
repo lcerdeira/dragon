@@ -460,11 +460,19 @@ impl ZarrFmIndex {
     }
 
     /// Read `text[start..end]` via a single chunked Zarr read.
-    fn text_slice(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+    pub fn text_slice(&self, start: u64, end: u64) -> Result<Vec<u8>> {
         let end = end.min(self.text_len);
         if end <= start { return Ok(Vec::new()); }
         let subset = ArraySubset::new_with_ranges(&[start..end]);
         Ok(self.text.retrieve_array_subset(&subset)?)
+    }
+
+    /// Read the entire suffix array into memory (linear order, as usize).
+    /// Used to materialise an in-memory FM-index for fast repeated queries.
+    pub fn read_all_sa(&self) -> Result<Vec<usize>> {
+        let subset = ArraySubset::new_with_ranges(&[0..self.sa_len]);
+        let vals: Vec<u64> = self.sa.retrieve_array_subset(&subset)?;
+        Ok(vals.into_iter().map(|v| v as usize).collect())
     }
 
     fn lower_bound(&self, pattern: &[u8]) -> Result<u64> {

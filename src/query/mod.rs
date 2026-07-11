@@ -9,6 +9,7 @@ pub mod ml_score;
 pub mod seed;
 pub mod spaced_seed;
 pub mod sprt;
+pub mod zarr_align;
 
 use anyhow::Result;
 use std::collections::HashSet;

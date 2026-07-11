@@ -289,7 +289,14 @@ pub fn containment_rank(
     // (most specific) unitigs until it is large enough. The true source
     // genome — and any genome that genuinely contains the query — shares the
     // query's most specific k-mers, so it is always captured. ----
-    const CANDIDATE_TARGET: u64 = 2000;
+    // Soft target for the greedy candidate set. 2000 capped recall on
+    // population-scale surveillance: a gene carried by ~3600 genomes left a
+    // sub-clade of carriers (sharing slightly less-specific unitigs) ranked
+    // just below the cutoff and never aligned, even at 100% identity / full
+    // coverage. 8000 captures all carriers of a per-species panel gene with
+    // margin while staying bounded (the AND with each unitig's colours keeps
+    // per-k-mer work proportional to this, not to the whole collection).
+    const CANDIDATE_TARGET: u64 = 8000;
     // When a KmerCache is available, sort by IDF descending (most discriminative first).
     // Otherwise sort by cardinality ascending (rarest first) — same logic as before.
     let mut by_weight: Vec<(u32, f64)> = unitig_colors
@@ -323,7 +330,13 @@ pub fn containment_rank(
     // ---- Phase 3: score ONLY candidate genomes. Each hit unitig's color set
     // is intersected with the candidate set (fast Roaring AND), so per-k-mer
     // work is bounded by the candidate set, not the whole genome collection. ----
-    const MAX_SEEDS_PER_GENOME: usize = 64;
+    // Cap seeds kept per genome. A flat 64 is dense for ~1 kb AMR genes but far
+    // too sparse for large genes: a 9.6 kb gene (e.g. clbB) filled the bucket
+    // from its first ~1.5 kb and dropped every later seed, so the alignment
+    // window missed the rest of the gene (and, for genes split across a contig
+    // boundary, anchored on the wrong fragment). Scale ~1 seed per 16 bp of
+    // query so seeds span the full gene, with a 64 floor for short queries.
+    let max_seeds_per_genome: usize = (query.len() / 16).max(64);
     let mut genome_shared: HashMap<u32, usize> = HashMap::new();
     let mut genome_info: HashMap<u32, f64> = HashMap::new();
     let mut genome_seeds: HashMap<u32, Vec<SeedHit>> = HashMap::new();
@@ -350,10 +363,13 @@ pub fn containment_rank(
             for genome_id in credited.iter() {
                 if count_this {
                     *genome_shared.entry(genome_id).or_insert(0) += 1;
+                    // Gate IC with the same per-position guard as genome_shared;
+                    // otherwise a position matched on both strands double-adds IC
+                    // and skews the (info-score) ranking.
+                    *genome_info.entry(genome_id).or_insert(0.0) += ic;
                 }
-                *genome_info.entry(genome_id).or_insert(0.0) += ic;
                 let bucket = genome_seeds.entry(genome_id).or_default();
-                if bucket.len() < MAX_SEEDS_PER_GENOME {
+                if bucket.len() < max_seeds_per_genome {
                     bucket.push(seed.clone());
                 }
             }
