@@ -190,7 +190,7 @@ pub fn align_query(
         max_target_seqs
     };
     let mut records =
-        direct_align_candidates(query, query_name, &hits, &r.path_index, &r.unitigs, cap);
+        direct_align_candidates(query, query_name, &hits, &r.path_index, &r.unitigs, cap, false);
     // Same post-alignment filters as the binary `dragon search` pipeline.
     let ql = query.len() as f64;
     records.retain(|rec| {

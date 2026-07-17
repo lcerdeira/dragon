@@ -87,6 +87,7 @@ fn real_genome_self_slice_aligns_perfectly() {
         batch_queries: true,
         parallel_shards: false,
         cross_species: false,
+        align_once: false,
     };
     let results = search(&q_path, &config).expect("search");
     assert_eq!(results.len(), 1);

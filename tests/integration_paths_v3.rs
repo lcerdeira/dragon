@@ -130,6 +130,7 @@ fn search_works_on_v3_migrated_index() {
         batch_queries: true,
         parallel_shards: false,
         cross_species: false,
+        align_once: false,
     };
     let results = search(&q_path, &config).expect("search");
     let best = &results[0].alignments[0];
