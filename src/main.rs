@@ -119,6 +119,13 @@ enum Commands {
         #[arg(long, default_value = "default")]
         preset: String,
 
+        /// Align-once mode: align each distinct reference window exactly once and
+        /// project the alignment onto every genome sharing it. WFA work scales with
+        /// sequence diversity, not genome count. Forces WFA (skips the graph-DP
+        /// aligner); projected records are identical to the default per-genome path.
+        #[arg(long)]
+        align_once: bool,
+
         /// Disable batch-query mode (process queries one at a time; required for --dump-seeds)
         #[arg(long)]
         no_batch: bool,
@@ -476,6 +483,7 @@ fn main() -> Result<()> {
             min_query_coverage,
             min_score_ratio,
             preset,
+            align_once,
             no_batch,
             no_parallel_shards,
             profile,
@@ -571,6 +579,7 @@ fn main() -> Result<()> {
                 batch_queries: eff_batch,
                 parallel_shards: eff_parallel_shards,
                 cross_species: eff_cross_species,
+                align_once,
             };
 
             let results = if shard.is_empty() {

@@ -52,6 +52,12 @@ fn rss_mb() -> Option<u64> {
 }
 
 /// Align a query directly against top candidate genomes.
+///
+/// When `align_once` is true, candidates that trace an identical reference
+/// window (byte-identical `ref_seq` on the same strand) are aligned with a
+/// single WFA call and the alignment is projected onto every member — so WFA
+/// cost scales with sequence *diversity*, not genome *count*. The default
+/// (false) path aligns every candidate independently and is left untouched.
 pub fn direct_align_candidates(
     query: &[u8],
     query_name: &str,
@@ -59,7 +65,14 @@ pub fn direct_align_candidates(
     path_index: &PathIndex,
     unitigs: &UnitigSet,
     max_candidates: usize,
+    align_once: bool,
 ) -> Vec<PafRecord> {
+    if align_once {
+        return direct_align_once(
+            query, query_name, candidates, path_index, unitigs, max_candidates,
+        );
+    }
+
     let mut records = Vec::new();
     let to_process = candidates.len().min(max_candidates);
     log::info!("[direct_align] entering with {} candidates ({} considered)",
@@ -114,26 +127,7 @@ pub fn direct_align_candidates(
         let unitig_step: HashMap<u32, PathStep> =
             path_index.find_unitig_steps(hit.genome_id, &wanted);
 
-        // Partition seeds by EFFECTIVE strand of the query→genome match,
-        // not by seed.is_reverse alone. The effective strand is the XOR
-        // of seed.is_reverse (was the QUERY RC'd when searching the
-        // FM-index?) and step.is_reverse (is the GENOME reading the
-        // unitig in RC?). Only seeds whose XOR is false anchor a
-        // forward-strand alignment; the others anchor a reverse-strand
-        // alignment and need the query RC'd before WFA.
-        let mut fwd_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
-        let mut rev_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
-        for s in &hit.seeds {
-            let step_rev = unitig_step
-                .get(&s.unitig_id)
-                .map(|st| st.is_reverse)
-                .unwrap_or(false);
-            if s.is_reverse == step_rev {
-                fwd_seeds.push(s);
-            } else {
-                rev_seeds.push(s);
-            }
-        }
+        let (fwd_seeds, rev_seeds) = partition_seeds(&hit.seeds, &unitig_step);
 
         if let Some(record) = align_with_seeds(
             query, query_name, &fwd_seeds, hit, path_index, hit.genome_id,
@@ -157,25 +151,56 @@ pub fn direct_align_candidates(
     records
 }
 
-/// Build a PAF record by running WFA on the seed-anchored region.
-fn align_with_seeds(
+/// Partition a candidate's seeds by EFFECTIVE strand of the query→genome
+/// match, not by `seed.is_reverse` alone. The effective strand is the XOR of
+/// `seed.is_reverse` (was the QUERY RC'd when searching the FM-index?) and
+/// `step.is_reverse` (is the GENOME reading the unitig in RC?). Seeds whose
+/// XOR is false anchor a forward-strand alignment; the others anchor a
+/// reverse-strand alignment and need the query RC'd before WFA.
+fn partition_seeds<'a>(
+    seeds: &'a [crate::index::fm::SeedHit],
+    unitig_step: &HashMap<u32, PathStep>,
+) -> (
+    Vec<&'a crate::index::fm::SeedHit>,
+    Vec<&'a crate::index::fm::SeedHit>,
+) {
+    let mut fwd_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
+    let mut rev_seeds: Vec<&crate::index::fm::SeedHit> = Vec::new();
+    for s in seeds {
+        let step_rev = unitig_step
+            .get(&s.unitig_id)
+            .map(|st| st.is_reverse)
+            .unwrap_or(false);
+        if s.is_reverse == step_rev {
+            fwd_seeds.push(s);
+        } else {
+            rev_seeds.push(s);
+        }
+    }
+    (fwd_seeds, rev_seeds)
+}
+
+/// Genome-coordinate extraction window derived from seed anchors. This is the
+/// cheap, per-genome part of alignment (path walk only, no WFA). Two genomes
+/// tracing the same unitig walk over the window yield byte-identical
+/// `ref_seq`, which is what `align_once` exploits to share the WFA call.
+struct WindowSpec {
+    extract_start: u64,
+    extract_end: u64,
+    ref_min: u64,
+}
+
+/// Compute the reference extraction window for a set of same-strand seeds.
+/// Returns `None` when the seeds produce no usable anchor cluster (matching
+/// the early-return points of the original monolithic aligner).
+fn compute_window(
     query: &[u8],
-    query_name: &str,
     seeds: &[&crate::index::fm::SeedHit],
-    hit: &ContainmentHit,
-    path_index: &PathIndex,
-    genome_id: u32,
-    genome_name: &str,
-    genome_len: u64,
     unitig_step: &HashMap<u32, PathStep>,
     unitigs: &UnitigSet,
-    all_candidates: &[ContainmentHit],
     is_reverse: bool,
-) -> Option<PafRecord> {
-    if seeds.is_empty() {
-        return None;
-    }
-
+    genome_len: u64,
+) -> Option<WindowSpec> {
     // Map seeds to genome coordinates via the path index. The genome
     // position of the seed match depends ONLY on step.is_reverse:
     //   * step.is_reverse=false: genome reads the unitig forward, so
@@ -304,8 +329,7 @@ fn align_with_seeds(
     let extract_end = (est_ref_end_for_query + ALIGN_PAD as u64).min(genome_len);
 
     log::debug!(
-        "[align_with_seeds] genome={} q_len={} anchors={} ref_min={} ref_max={} extract=[{}, {}) win={}",
-        genome_id,
+        "[compute_window] q_len={} anchors={} ref_min={} ref_max={} extract=[{}, {}) win={}",
         query.len(),
         anchors.len(),
         ref_min,
@@ -314,6 +338,229 @@ fn align_with_seeds(
         extract_end,
         extract_end.saturating_sub(extract_start),
     );
+
+    Some(WindowSpec {
+        extract_start,
+        extract_end,
+        ref_min,
+    })
+}
+
+/// Everything a WFA call needs, plus the per-genome offset used to project
+/// alignment-window coordinates back into genome coordinates. `query_oriented`
+/// and `t` fully determine the WFA result; `extract_window_start` is the only
+/// field that varies between genomes sharing an identical `t`.
+struct AlignPrep {
+    query_oriented: Vec<u8>,
+    t: Vec<u8>,
+    extract_window_start: u64,
+}
+
+/// Extract and size the reference text for WFA (per-genome; walk only, no
+/// WFA). Reproduces the reference-extraction, trimming, query-orientation and
+/// window-growth logic of the original aligner. Returns `None` if no reference
+/// could be extracted or the query is genuinely longer than the genome region.
+fn wfa_prepare(
+    query: &[u8],
+    path_index: &PathIndex,
+    genome_id: u32,
+    genome_len: u64,
+    unitigs: &UnitigSet,
+    win: &WindowSpec,
+    is_reverse: bool,
+) -> Option<AlignPrep> {
+    let extract_start = win.extract_start;
+    let extract_end = win.extract_end;
+    let ref_min = win.ref_min;
+
+    let ref_seq = path_index.extract_sequence_window(
+        genome_id,
+        extract_start,
+        extract_end,
+        unitigs,
+    );
+    if ref_seq.is_empty() {
+        return None;
+    }
+    log::debug!(
+        "[wfa_prepare] genome={} ref_seq.len()={}",
+        genome_id, ref_seq.len()
+    );
+
+    // Hard cap on the alignment text size: never feed WFA more than
+    // 4 · query.len() of reference. If extract_sequence_static produced
+    // more than that (e.g. because path steps overlap or expanded
+    // unexpectedly), trim the reference to a window centred on the
+    // anchor cluster's median in target-window coordinates.
+    let max_ref_len = (query.len() * 4).max(400);
+    let ref_seq = if ref_seq.len() > max_ref_len {
+        let median_in_window = (ref_min - extract_start) as usize;
+        let half = max_ref_len / 2;
+        let lo = median_in_window.saturating_sub(half);
+        let hi = (lo + max_ref_len).min(ref_seq.len());
+        log::debug!(
+            "[wfa_prepare] trimmed ref_seq from {} -> {} bp (window {}..{})",
+            ref_seq.len(),
+            hi - lo,
+            lo,
+            hi
+        );
+        ref_seq[lo..hi].to_vec()
+    } else {
+        ref_seq
+    };
+
+    // Align the FULL query (not just the seed-covered portion). WFA does
+    // global alignment, so giving it the whole query against a tightly-sized
+    // reference window produces meaningful identity numbers.
+    let mut query_oriented: Vec<u8> = query.to_vec();
+    if is_reverse {
+        query_oriented = reverse_complement(&query_oriented);
+    }
+
+    // WFA constraint: query.len() <= text.len(). If padding wasn't enough,
+    // grow the reference window symmetrically.
+    let q_len = query_oriented.len();
+    let mut t = ref_seq;
+    if q_len > t.len() {
+        let need = q_len - t.len() + 16;
+        let extra_left = (need / 2) as u64;
+        let extra_right = (need - extra_left as usize) as u64;
+        let new_start = extract_start.saturating_sub(extra_left);
+        let new_end = (extract_end + extra_right).min(genome_len);
+        t = path_index.extract_sequence_window(genome_id, new_start, new_end, unitigs);
+        if q_len > t.len() {
+            // Cannot align — query truly longer than the genome region.
+            return None;
+        }
+    }
+
+    let extract_window_start = if q_len > t.len() {
+        // Re-derived window already used above; recompute conservatively.
+        let pad_lhs = ALIGN_PAD as u64;
+        ref_min.saturating_sub(pad_lhs)
+    } else {
+        extract_start
+    };
+
+    Some(AlignPrep {
+        query_oriented,
+        t,
+        extract_window_start,
+    })
+}
+
+/// The expensive step: a pure function of `(query_oriented, t)`. Every genome
+/// in an `align_once` group shares this result.
+fn wfa_run(prep: &AlignPrep) -> Option<Alignment> {
+    let q_str = std::str::from_utf8(&prep.query_oriented).ok()?;
+    let t_str = std::str::from_utf8(&prep.t).ok()?;
+    wavefront_align(q_str, t_str, &default_penalties()).ok()
+}
+
+/// Project a shared WFA alignment onto a specific genome, producing its PAF
+/// record. CIGAR / identity / matches / query-coords come from the shared
+/// alignment; `target_start`/`target_end` use this genome's
+/// `extract_window_start`; tags and MAPQ use this genome's containment hit.
+#[allow(clippy::too_many_arguments)]
+fn wfa_project(
+    alignment: &Alignment,
+    prep: &AlignPrep,
+    query: &[u8],
+    query_name: &str,
+    hit: &ContainmentHit,
+    genome_name: &str,
+    genome_len: u64,
+    all_candidates: &[ContainmentHit],
+    is_reverse: bool,
+) -> PafRecord {
+    // Translate the WFA aligned strings into CIGAR + counts.
+    let stats = AlignmentStats::from_wfa(alignment);
+
+    // Compute genome-coordinate target span from the leading/trailing
+    // text-side gaps so target_start/target_end describe only the aligned
+    // portion (not the padded extraction window).
+    let text_lead_in_ref =
+        leading_gap_consumed(&alignment.query_aligned, &alignment.text_aligned);
+    let aligned_target_len = stats.target_consumed;
+    let target_start_in_window = text_lead_in_ref;
+    let target_end_in_window = target_start_in_window + aligned_target_len;
+
+    let extract_window_start = prep.extract_window_start;
+    let target_start = extract_window_start as usize + target_start_in_window;
+    let target_end = extract_window_start as usize + target_end_in_window;
+
+    // Query span on the original (un-RC'd) coordinates. We align the full
+    // query, so coordinate mapping just needs to undo the reverse-complement
+    // when applicable. Clamp to [0, L] so a reverse-strand alignment with a
+    // leading text-side gap cannot underflow or push query_end past L.
+    let q_lead_gap =
+        leading_gap_consumed(&alignment.text_aligned, &alignment.query_aligned);
+    let q_aligned_len = stats.query_consumed;
+    let l = prep.query_oriented.len();
+    let (final_q_start, final_q_end) = if is_reverse {
+        // We aligned RC(query) against t.
+        // Map back: a RC slice's [a, b) corresponds to original [L-b, L-a).
+        let a = q_lead_gap.min(l);
+        let b = (a + q_aligned_len).min(l);
+        (l - b, l - a)
+    } else {
+        let a = q_lead_gap.min(l);
+        (a, (a + q_aligned_len).min(l))
+    };
+
+    let alignment_len = stats.alignment_len;
+    let num_matches = stats.matches;
+
+    let identity = if alignment_len == 0 {
+        0.0
+    } else {
+        num_matches as f64 / alignment_len as f64
+    };
+
+    let mut tags = containment_tags(hit, query.len());
+    tags.push(format!("NM:i:{}", stats.edits));
+    tags.push(format!("de:f:{:.4}", 1.0 - identity));
+    tags.push(format!("cg:Z:{}", stats.cigar));
+
+    PafRecord {
+        query_name: query_name.to_string(),
+        query_len: query.len(),
+        query_start: final_q_start,
+        query_end: final_q_end,
+        strand: if is_reverse { '-' } else { '+' },
+        target_name: genome_name.to_string(),
+        target_len: genome_len as usize,
+        target_start,
+        target_end,
+        num_matches,
+        alignment_len,
+        mapq: estimate_mapq(hit, all_candidates),
+        tags,
+    }
+}
+
+/// Build a PAF record by running WFA on the seed-anchored region.
+#[allow(clippy::too_many_arguments)]
+fn align_with_seeds(
+    query: &[u8],
+    query_name: &str,
+    seeds: &[&crate::index::fm::SeedHit],
+    hit: &ContainmentHit,
+    path_index: &PathIndex,
+    genome_id: u32,
+    genome_name: &str,
+    genome_len: u64,
+    unitig_step: &HashMap<u32, PathStep>,
+    unitigs: &UnitigSet,
+    all_candidates: &[ContainmentHit],
+    is_reverse: bool,
+) -> Option<PafRecord> {
+    if seeds.is_empty() {
+        return None;
+    }
+
+    let win = compute_window(query, seeds, unitig_step, unitigs, is_reverse, genome_len)?;
 
     // ── Graph-aware alignment (v4 PathIndex only) ────────────────────────────
     // For v4 indices, attempt a graph-anchored DP alignment before falling
@@ -402,162 +649,172 @@ fn align_with_seeds(
     }
     // ── End graph-aware alignment ────────────────────────────────────────────
 
-    let ref_seq = path_index.extract_sequence_window(
-        genome_id,
-        extract_start,
-        extract_end,
-        unitigs,
+    // WFA fallback: prepare the reference text (cheap walk), run WFA
+    // (expensive), and project onto this genome. The same three steps power
+    // `direct_align_once`, which shares one `wfa_run` across all genomes with
+    // an identical reference window.
+    let prep = wfa_prepare(query, path_index, genome_id, genome_len, unitigs, &win, is_reverse)?;
+    let alignment = wfa_run(&prep)?;
+    Some(wfa_project(
+        &alignment, &prep, query, query_name, hit, genome_name, genome_len,
+        all_candidates, is_reverse,
+    ))
+}
+
+/// Align-once: align each distinct reference window exactly once and project
+/// the result onto every genome that shares it.
+///
+/// BLAST/LexicMap do alignment work proportional to the number of matching
+/// genomes. Because Dragon's compacted de Bruijn graph guarantees that genomes
+/// tracing the same unitig walk over a window are byte-identical there, all
+/// such genomes yield an identical WFA alignment. We therefore group candidates
+/// by `(strand, ref_seq)`, run WFA once per group, and project (a cheap,
+/// per-genome coordinate remap) onto each member. WFA calls then scale with
+/// sequence *diversity*, not genome *count* — the information-theoretic minimum.
+///
+/// This path always uses WFA (the pure function of `ref_seq`); the graph-DP
+/// aligner, which handles structural variation, remains the separate default
+/// mode. Projected records are identical, field-for-field, to what the default
+/// per-genome WFA path would emit for the same candidate.
+fn direct_align_once(
+    query: &[u8],
+    query_name: &str,
+    candidates: &[ContainmentHit],
+    path_index: &PathIndex,
+    unitigs: &UnitigSet,
+    max_candidates: usize,
+) -> Vec<PafRecord> {
+    let to_process = candidates.len().min(max_candidates);
+    log::info!(
+        "[align-once] entering with {} candidates ({} considered)",
+        candidates.len(), to_process
     );
-    if ref_seq.is_empty() {
-        return None;
-    }
-    log::debug!(
-        "[align_with_seeds] genome={} ref_seq.len()={}",
-        genome_id, ref_seq.len()
-    );
+    if let Some(mb) = rss_mb() { log::info!("[align-once] RSS={} MB", mb); }
 
-    // Hard cap on the alignment text size: never feed WFA more than
-    // 4 · query.len() of reference. If extract_sequence_static produced
-    // more than that (e.g. because path steps overlap or expanded
-    // unexpectedly), trim the reference to a window centred on the
-    // anchor cluster's median in target-window coordinates.
-    let max_ref_len = (query.len() * 4).max(400);
-    let ref_seq = if ref_seq.len() > max_ref_len {
-        let median_in_window = (ref_min - extract_start) as usize;
-        let half = max_ref_len / 2;
-        let lo = median_in_window.saturating_sub(half);
-        let hi = (lo + max_ref_len).min(ref_seq.len());
-        log::debug!(
-            "[align_with_seeds] trimmed ref_seq from {} -> {} bp (window {}..{})",
-            ref_seq.len(),
-            hi - lo,
-            lo,
-            hi
-        );
-        ref_seq[lo..hi].to_vec()
-    } else {
-        ref_seq
-    };
-
-    // Align the FULL query (not just the seed-covered portion). Slicing to
-    // query[query_min..query_max] artificially capped query coverage at
-    // (query_max - query_min) / query.len() — typically ~50 % for short
-    // queries — even when the rest of the query was present in the
-    // genome. WFA does global alignment, so giving it the whole query
-    // against a tightly-sized reference window produces meaningful
-    // identity numbers.
-    let mut query_oriented: Vec<u8> = query.to_vec();
-    let query_min_in_align: usize = 0;
-    if is_reverse {
-        query_oriented = reverse_complement(&query_oriented);
+    // A per-genome preparation, ready to be projected once its WFA group runs.
+    struct PrepTask<'a> {
+        prep: AlignPrep,
+        hit: &'a ContainmentHit,
+        genome_name: String,
+        genome_len: u64,
+        is_reverse: bool,
     }
 
-    // WFA constraint: query.len() <= text.len(). If padding wasn't enough,
-    // grow the reference window symmetrically.
-    let q_len = query_oriented.len();
-    let mut t = ref_seq;
-    if q_len > t.len() {
-        let need = q_len - t.len() + 16;
-        let extra_left = (need / 2) as u64;
-        let extra_right = (need - extra_left as usize) as u64;
-        let new_start = extract_start.saturating_sub(extra_left);
-        let new_end = (extract_end + extra_right).min(genome_len);
-        t = path_index.extract_sequence_window(genome_id, new_start, new_end, unitigs);
-        if q_len > t.len() {
-            // Cannot align — query truly longer than the genome region.
-            return None;
+    let mut records = Vec::new();
+    let mut tasks: Vec<PrepTask> = Vec::new();
+
+    for hit in candidates.iter().take(max_candidates) {
+        let (genome_name, genome_len) = match path_index.genome_meta(hit.genome_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        if genome_len == 0 {
+            continue;
+        }
+
+        if hit.seeds.is_empty() {
+            // No seed anchors — containment-only summary row (no WFA, no CIGAR).
+            // Identical to the default path's fallback.
+            let identity = hit.containment;
+            if identity < 0.01 {
+                continue;
+            }
+            records.push(PafRecord {
+                query_name: query_name.to_string(),
+                query_len: query.len(),
+                query_start: 0,
+                query_end: query.len(),
+                strand: '+',
+                target_name: genome_name,
+                target_len: genome_len as usize,
+                target_start: 0,
+                target_end: query.len().min(genome_len as usize),
+                num_matches: (query.len() as f64 * identity) as usize,
+                alignment_len: query.len(),
+                mapq: estimate_mapq(hit, candidates),
+                tags: containment_tags(hit, query.len()),
+            });
+            continue;
+        }
+
+        let wanted: HashSet<u32> = hit.seeds.iter().map(|s| s.unitig_id).collect();
+        let unitig_step: HashMap<u32, PathStep> =
+            path_index.find_unitig_steps(hit.genome_id, &wanted);
+        let (fwd_seeds, rev_seeds) = partition_seeds(&hit.seeds, &unitig_step);
+
+        for (seeds, is_reverse) in [(&fwd_seeds, false), (&rev_seeds, true)] {
+            if seeds.is_empty() {
+                continue;
+            }
+            let win = match compute_window(
+                query, seeds, &unitig_step, unitigs, is_reverse, genome_len,
+            ) {
+                Some(w) => w,
+                None => continue,
+            };
+            let prep = match wfa_prepare(
+                query, path_index, hit.genome_id, genome_len, unitigs, &win, is_reverse,
+            ) {
+                Some(p) => p,
+                None => continue,
+            };
+            tasks.push(PrepTask {
+                prep,
+                hit,
+                genome_name: genome_name.clone(),
+                genome_len,
+                is_reverse,
+            });
         }
     }
 
-    // Run WFA.
-    let q_str = match std::str::from_utf8(&query_oriented) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-    let t_str = match std::str::from_utf8(&t) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-    let alignment = match wavefront_align(q_str, t_str, &default_penalties()) {
-        Ok(a) => a,
-        Err(_) => return None,
-    };
+    // Group prep tasks by (strand, reference text). The reference bytes fully
+    // determine the WFA result for a given oriented query, so one WFA call per
+    // group suffices. Using the actual bytes as the key (not a hash) avoids any
+    // collision merging distinct references into one alignment.
+    let mut groups: HashMap<(bool, Vec<u8>), Vec<usize>> = HashMap::new();
+    for (i, task) in tasks.iter().enumerate() {
+        groups
+            .entry((task.is_reverse, task.prep.t.clone()))
+            .or_default()
+            .push(i);
+    }
+    log::info!(
+        "[align-once] {} genome alignments collapsed to {} distinct WFA calls ({:.1}× fewer)",
+        tasks.len(),
+        groups.len(),
+        if groups.is_empty() { 0.0 } else { tasks.len() as f64 / groups.len() as f64 },
+    );
 
-    // Translate the WFA aligned strings into CIGAR + counts.
-    let stats = AlignmentStats::from_wfa(&alignment);
+    for members in groups.values() {
+        // All members share (query_oriented, t), so run WFA on the first.
+        let representative = &tasks[members[0]];
+        let alignment = match wfa_run(&representative.prep) {
+            Some(a) => a,
+            None => continue,
+        };
+        for &idx in members {
+            let task = &tasks[idx];
+            records.push(wfa_project(
+                &alignment,
+                &task.prep,
+                query,
+                query_name,
+                task.hit,
+                &task.genome_name,
+                task.genome_len,
+                candidates,
+                task.is_reverse,
+            ));
+        }
+    }
 
-    // Compute genome-coordinate target span from the leading/trailing
-    // text-side gaps so target_start/target_end describe only the aligned
-    // portion (not the padded extraction window).
-    let text_lead_in_ref = leading_gap_consumed(&alignment.query_aligned, &alignment.text_aligned);
-
-    // text-side leading skip = bases of t consumed before the alignment proper begins
-    let aligned_target_len = stats.target_consumed;
-    let target_start_in_window = text_lead_in_ref;
-    let target_end_in_window = target_start_in_window + aligned_target_len;
-
-    let extract_window_start = if q_len > t.len() {
-        // Re-derived window already used above; recompute conservatively.
-        let pad_lhs = ALIGN_PAD as u64;
-        ref_min.saturating_sub(pad_lhs)
-    } else {
-        extract_start
-    };
-    let target_start = extract_window_start as usize + target_start_in_window;
-    let target_end = extract_window_start as usize + target_end_in_window;
-
-    // Query span on the original (un-RC'd) coordinates. We now align the
-    // full query (query_min_in_align == 0 after the slicing change above),
-    // so coordinate mapping just needs to undo the reverse-complement when
-    // applicable.
-    let q_lead_gap = leading_gap_consumed(&alignment.text_aligned, &alignment.query_aligned);
-    let q_aligned_len = stats.query_consumed;
-    let _ = query_min_in_align; // placeholder; full query is always 0..query.len()
-    // Clamp to [0, L] so a reverse-strand alignment with a leading text-side
-    // gap (where q_lead_gap can already be counted in query_consumed) cannot
-    // underflow `l - b` (panic in debug / wrap in release) or push the forward
-    // query_end past the query length.
-    let l = q_str.len();
-    let (final_q_start, final_q_end) = if is_reverse {
-        // We aligned RC(query) against t.
-        // Map back: a RC slice's [a, b) corresponds to original [L-b, L-a).
-        let a = q_lead_gap.min(l);
-        let b = (a + q_aligned_len).min(l);
-        (l - b, l - a)
-    } else {
-        let a = q_lead_gap.min(l);
-        (a, (a + q_aligned_len).min(l))
-    };
-
-    let alignment_len = stats.alignment_len;
-    let num_matches = stats.matches;
-
-    let identity = if alignment_len == 0 {
-        0.0
-    } else {
-        num_matches as f64 / alignment_len as f64
-    };
-
-    let mut tags = containment_tags(hit, query.len());
-    tags.push(format!("NM:i:{}", stats.edits));
-    tags.push(format!("de:f:{:.4}", 1.0 - identity));
-    tags.push(format!("cg:Z:{}", stats.cigar));
-
-    Some(PafRecord {
-        query_name: query_name.to_string(),
-        query_len: query.len(),
-        query_start: final_q_start,
-        query_end: final_q_end,
-        strand: if is_reverse { '-' } else { '+' },
-        target_name: genome_name.to_string(),
-        target_len: genome_len as usize,
-        target_start,
-        target_end,
-        num_matches,
-        alignment_len,
-        mapq: estimate_mapq(hit, all_candidates),
-        tags,
-    })
+    records.sort_by(|a, b| {
+        let a_score = extract_as_tag(a);
+        let b_score = extract_as_tag(b);
+        b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    records
 }
 
 /// Per-alignment statistics derived from the aligned strings emitted by WFA.

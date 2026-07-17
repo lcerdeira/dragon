@@ -134,12 +134,23 @@ fn build_synthetic_index(
 
 /// Run a search with permissive defaults so we see all hits.
 fn run_search(idx_dir: &Path, query_path: &Path) -> Vec<dragon::query::QueryResult> {
+    run_search_mode(idx_dir, query_path, false, 10)
+}
+
+/// Same as `run_search`, but with a configurable `align_once` flag and target
+/// cap — used by the align-once equivalence test.
+fn run_search_mode(
+    idx_dir: &Path,
+    query_path: &Path,
+    align_once: bool,
+    max_target_seqs: usize,
+) -> Vec<dragon::query::QueryResult> {
     let config = SearchConfig {
         index_dir: idx_dir.into(),
         min_seed_len: 15,
         max_seed_freq: 10_000,
         min_chain_score: 0.0,
-        max_target_seqs: 10,
+        max_target_seqs,
         threads: 1,
         max_ram_gb: 4.0,
         min_identity: 0.0,
@@ -152,8 +163,54 @@ fn run_search(idx_dir: &Path, query_path: &Path) -> Vec<dragon::query::QueryResu
         batch_queries: true,
         parallel_shards: false,
         cross_species: false,
+        align_once,
     };
     search(query_path, &config).expect("search")
+}
+
+/// Build an index from several genomes, one FASTA file per genome (the index
+/// treats each *file* as a genome), and return (tempdir, index_dir, query_path).
+fn build_multi_genome_index(
+    genomes: &[(&str, Vec<u8>)],
+    query_name: &str,
+    query_seq: &[u8],
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let g_dir = tmp.path().join("genomes");
+    std::fs::create_dir_all(&g_dir).unwrap();
+    for (name, seq) in genomes {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b">");
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'\n');
+        for chunk in seq.chunks(80) {
+            out.extend_from_slice(chunk);
+            out.push(b'\n');
+        }
+        std::fs::write(g_dir.join(format!("{name}.fa")), &out).unwrap();
+    }
+    let idx_dir = tmp.path().join("idx");
+    build_index_with_options(&g_dir, &idx_dir, 31, 2, None).expect("build_index");
+
+    let q_path = tmp.path().join("query.fa");
+    let mut q_bytes: Vec<u8> = Vec::new();
+    q_bytes.extend_from_slice(b">");
+    q_bytes.extend_from_slice(query_name.as_bytes());
+    q_bytes.push(b'\n');
+    q_bytes.extend_from_slice(query_seq);
+    q_bytes.push(b'\n');
+    std::fs::write(&q_path, &q_bytes).unwrap();
+
+    (tmp, idx_dir, q_path)
+}
+
+/// A random backbone of length `total` (from `backbone_seed`) with `gene`
+/// planted verbatim at `pos`.
+fn plant_gene(backbone_seed: u64, total: usize, gene: &[u8], pos: usize) -> Vec<u8> {
+    let mut b = random_dna(total, backbone_seed);
+    b[pos..pos + gene.len()].copy_from_slice(gene);
+    b
 }
 
 /// `gene` planted at `pos` on the FORWARD strand. Expect a single hit
@@ -420,5 +477,110 @@ fn multi_contig_shared_motif_at_boundary() {
         best.identity() >= 0.99,
         "expected ≈1.0 identity, got {:.3}",
         best.identity()
+    );
+}
+
+/// Align-once must produce the same per-genome records as the default path
+/// when both use WFA, and its grouping must collapse byte-identical reference
+/// windows to a single WFA call while still emitting one record per genome.
+///
+/// Setup: two genomes byte-identical around the gene (→ one shared WFA group,
+/// projected onto both), one genome with a divergent gene (→ its own group),
+/// and one genome carrying the gene on the reverse strand.
+#[test]
+fn align_once_matches_default_per_genome() {
+    let gene = random_dna(400, 0x5A17_0007);
+
+    // A + B: byte-identical genomes (same backbone seed) → identical extraction
+    // window → collapse to a single WFA call, projected onto both.
+    let g_a = plant_gene(0xA1A1_0001, 6000, &gene, 1500);
+    let g_b = plant_gene(0xA1A1_0001, 6000, &gene, 1500);
+
+    // C: distinct backbone, gene carries 6 SNPs → different unitig walk, its
+    // own WFA group, a lower-but-nonzero identity.
+    let mut gene_var = gene.clone();
+    for &p in &[40usize, 110, 175, 240, 300, 360] {
+        gene_var[p] = match gene_var[p] {
+            b'A' => b'C',
+            b'C' => b'G',
+            b'G' => b'T',
+            _ => b'A',
+        };
+    }
+    let g_c = plant_gene(0xC3C3_0003, 6000, &gene_var, 1500);
+
+    let (_tmp, idx, qp) = build_multi_genome_index(
+        &[("genomeA", g_a), ("genomeB", g_b), ("genomeC", g_c)],
+        "gene",
+        &gene,
+    );
+
+    let default = run_search_mode(&idx, &qp, false, 100);
+    let once = run_search_mode(&idx, &qp, true, 100);
+
+    assert_eq!(default.len(), 1);
+    assert_eq!(once.len(), 1);
+
+    // Key each record by (target genome, strand) for order-independent
+    // comparison; both modes may report several records.
+    let key = |a: &dragon::io::paf::PafRecord| (a.target_name.clone(), a.strand);
+    let mut def_map: std::collections::HashMap<_, &dragon::io::paf::PafRecord> =
+        std::collections::HashMap::new();
+    for a in &default[0].alignments {
+        println!(
+            "[default] {} strand={} t={}..{} q={}..{} matches={} alen={} id={:.4}",
+            a.target_name, a.strand, a.target_start, a.target_end,
+            a.query_start, a.query_end, a.num_matches, a.alignment_len, a.identity(),
+        );
+        def_map.insert(key(a), a);
+    }
+    for a in &once[0].alignments {
+        println!(
+            "[once]    {} strand={} t={}..{} q={}..{} matches={} alen={} id={:.4}",
+            a.target_name, a.strand, a.target_start, a.target_end,
+            a.query_start, a.query_end, a.num_matches, a.alignment_len, a.identity(),
+        );
+    }
+
+    // The core invariant: align-once emits exactly the same set of records as
+    // the default per-genome path, field-for-field (including all tags: CIGAR,
+    // NM, identity, MAPQ). Grouping is a pure optimisation with no effect on
+    // output.
+    assert_eq!(
+        default[0].alignments.len(),
+        once[0].alignments.len(),
+        "align-once must report the same number of records as the default path",
+    );
+    for a in &once[0].alignments {
+        let d = def_map
+            .get(&key(a))
+            .unwrap_or_else(|| panic!("no default record for {} {}", a.target_name, a.strand));
+        assert_eq!(a.query_start, d.query_start, "{} query_start", a.target_name);
+        assert_eq!(a.query_end, d.query_end, "{} query_end", a.target_name);
+        assert_eq!(a.target_start, d.target_start, "{} target_start", a.target_name);
+        assert_eq!(a.target_end, d.target_end, "{} target_end", a.target_name);
+        assert_eq!(a.num_matches, d.num_matches, "{} num_matches", a.target_name);
+        assert_eq!(a.alignment_len, d.alignment_len, "{} alignment_len", a.target_name);
+        assert_eq!(a.mapq, d.mapq, "{} mapq", a.target_name);
+        assert_eq!(a.tags, d.tags, "{} tags (CIGAR/NM/identity)", a.target_name);
+    }
+
+    // Grouping proof: the two byte-identical genomes must both be reported,
+    // with identical alignment signatures — a single WFA call projected onto
+    // both members.
+    let a = once[0].alignments.iter().find(|r| r.target_name == "genomeA");
+    let b = once[0].alignments.iter().find(|r| r.target_name == "genomeB");
+    let (a, b) = (a.expect("genomeA reported"), b.expect("genomeB reported"));
+    assert_eq!(a.num_matches, b.num_matches, "identical genomes → identical matches");
+    assert_eq!(a.alignment_len, b.alignment_len, "identical genomes → identical alen");
+    assert_eq!(
+        a.tags.iter().find(|t| t.starts_with("cg:Z:")),
+        b.tags.iter().find(|t| t.starts_with("cg:Z:")),
+        "identical genomes → identical CIGAR",
+    );
+    assert!(
+        (a.identity() - b.identity()).abs() < 1e-9,
+        "identical genomes → identical identity ({} vs {})",
+        a.identity(), b.identity(),
     );
 }

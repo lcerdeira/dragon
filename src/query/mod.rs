@@ -265,6 +265,11 @@ pub struct SearchConfig {
     /// Enables detection of homologs at 70-85% ANI (T2 cross-species tier).
     /// Default: false (within-species, short-read mode).
     pub cross_species: bool,
+    /// Align-once mode: align each distinct reference window once and project
+    /// the result onto every genome sharing it (WFA cost ∝ sequence diversity,
+    /// not genome count). Forces WFA (skips the graph-DP aligner). Default:
+    /// false — every candidate is aligned independently.
+    pub align_once: bool,
 }
 
 impl Default for SearchConfig {
@@ -287,6 +292,7 @@ impl Default for SearchConfig {
             batch_queries: true,
             parallel_shards: true,
             cross_species: false,
+            align_once: false,
         }
     }
 }
@@ -466,6 +472,7 @@ pub fn search(
             &path_index,
             &unitigs,
             config.max_target_seqs,
+            config.align_once,
         );
 
         // Stage 5: post-alignment filters
