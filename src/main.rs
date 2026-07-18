@@ -412,6 +412,12 @@ enum Commands {
         /// (full WFA alignment — requires /paths in the store; local store only for now)
         #[arg(short, long, default_value = "containment")]
         format: String,
+
+        /// Align-once mode (with -f blast6/blast7): align each distinct reference
+        /// window once and project it onto every genome sharing it. Output is
+        /// identical to the per-genome path; only the WFA count drops.
+        #[arg(long)]
+        align_once: bool,
     },
 
     /// Migrate a legacy bincode `paths.bin` to the mmap-friendly v2 format.
@@ -1474,7 +1480,7 @@ echo "  Download complete."
             }
         }
 
-        Commands::SearchZarr { zarr, query, output, format } => {
+        Commands::SearchZarr { zarr, query, output, format, align_once } => {
             // Dispatch on URL scheme: http(s):// → lazy HTTP reader; else filesystem.
             let zarr_str = zarr.to_string_lossy();
             let is_http = zarr_str.starts_with("http://") || zarr_str.starts_with("https://");
@@ -1509,7 +1515,7 @@ echo "  Download complete."
                 let mut first = true;
                 for rec in &records {
                     let paf = dragon::query::zarr_align::align_query(
-                        &aref, &rec.seq, &rec.name, 0, 10_000, 0.7, 0.3,
+                        &aref, &rec.seq, &rec.name, 0, 10_000, 0.7, 0.3, align_once,
                     )?;
                     dragon::io::blast::write_blast_tabular(
                         &mut writer, &paf, aref.db_size, want_header && first,

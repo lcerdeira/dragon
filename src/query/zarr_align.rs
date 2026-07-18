@@ -100,6 +100,15 @@ pub fn load_zarr_ref(zarr: &Path) -> Result<ZarrAlignRef> {
 
 /// Align one query against a Zarr-backed reference, returning PAF records.
 /// `max_target_seqs == 0` means no cap.
+/// Align one query against the Zarr-sourced reference.
+///
+/// `align_once` enables the align-once aligner: candidates sharing a
+/// byte-identical reference window are aligned with a single WFA call and the
+/// result is projected onto every genome that shares it. Output is identical to
+/// the per-genome path; only the WFA count changes. This matters most for the
+/// published cloud catalog, where a single gene query can match tens of
+/// thousands of genomes.
+#[allow(clippy::too_many_arguments)]
 pub fn align_query(
     r: &ZarrAlignRef,
     query: &[u8],
@@ -108,6 +117,7 @@ pub fn align_query(
     max_seed_freq: usize,
     min_identity: f64,
     min_query_coverage: f64,
+    align_once: bool,
 ) -> Result<Vec<PafRecord>> {
     let k = r.k;
     if query.len() < k {
@@ -190,7 +200,7 @@ pub fn align_query(
         max_target_seqs
     };
     let mut records =
-        direct_align_candidates(query, query_name, &hits, &r.path_index, &r.unitigs, cap, false);
+        direct_align_candidates(query, query_name, &hits, &r.path_index, &r.unitigs, cap, align_once);
     // Same post-alignment filters as the binary `dragon search` pipeline.
     let ql = query.len() as f64;
     records.retain(|rec| {
