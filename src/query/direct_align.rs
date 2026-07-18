@@ -143,11 +143,7 @@ pub fn direct_align_candidates(
         }
     }
 
-    records.sort_by(|a, b| {
-        let a_score = extract_as_tag(a);
-        let b_score = extract_as_tag(b);
-        b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    records.sort_by(sort_records);
     records
 }
 
@@ -809,11 +805,7 @@ fn direct_align_once(
         }
     }
 
-    records.sort_by(|a, b| {
-        let a_score = extract_as_tag(a);
-        let b_score = extract_as_tag(b);
-        b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    records.sort_by(sort_records);
     records
 }
 
@@ -970,6 +962,26 @@ fn containment_tags(hit: &ContainmentHit, query_len: usize) -> Vec<String> {
     }
     tags.push(format!("n_eff:i:{}", hit.total_query_kmers));
     tags
+}
+
+/// Total order over output records: descending alignment score, then
+/// `(target_name, target_start, strand)` as tiebreakers.
+///
+/// The tiebreakers are what make the output *deterministic*: sorting by score
+/// alone leaves tied records (e.g. several genomes carrying an identical gene)
+/// in whatever order they were produced, which differs between the per-genome
+/// and align-once paths because align-once emits records grouped by shared
+/// reference window. With the tiebreakers, both paths emit byte-identical
+/// files, and downstream `max_target_seqs` truncation picks the same records.
+fn sort_records(a: &PafRecord, b: &PafRecord) -> std::cmp::Ordering {
+    let a_score = extract_as_tag(a);
+    let b_score = extract_as_tag(b);
+    b_score
+        .partial_cmp(&a_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.target_name.cmp(&b.target_name))
+        .then_with(|| a.target_start.cmp(&b.target_start))
+        .then_with(|| a.strand.cmp(&b.strand))
 }
 
 fn extract_as_tag(record: &PafRecord) -> f64 {
