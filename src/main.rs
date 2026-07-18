@@ -1541,6 +1541,20 @@ echo "  Download complete."
             //
             // `kmer_search` is a closure: |kmer| -> Vec<(unitig_id)>
             // `colors_of`  is a closure: |unitig_id| -> Vec<genome_id>
+            /// Reverse complement of a k-mer, for canonical-orientation lookups.
+            fn revcomp_kmer(kmer: &[u8]) -> Vec<u8> {
+                kmer.iter()
+                    .rev()
+                    .map(|&b| match b {
+                        b'A' | b'a' => b'T',
+                        b'T' | b't' => b'A',
+                        b'C' | b'c' => b'G',
+                        b'G' | b'g' => b'C',
+                        other => other,
+                    })
+                    .collect()
+            }
+
             fn containment_over_zarr(
                 seq: &[u8],
                 k: usize,
@@ -1565,7 +1579,20 @@ echo "  Download complete."
                         !matches!(b, b'A'|b'C'|b'G'|b'T'|b'a'|b'c'|b'g'|b't')
                     });
                     if !has_ambig {
-                        let positions = kmer_positions(kmer)?;
+                        // Search BOTH strands. The compacted de Bruijn graph stores
+                        // each unitig in a canonical orientation, so a gene whose
+                        // unitig was canonicalised reverse-complemented does not
+                        // appear forward in the text at all — searching only the
+                        // forward k-mer silently returns nothing for roughly half of
+                        // all sequences. The in-memory path (KmerCache) already
+                        // searches both strands; this one must match it.
+                        let mut positions = kmer_positions(kmer)?;
+                        let rc = revcomp_kmer(kmer);
+                        if rc != kmer {
+                            positions.extend(kmer_positions(&rc)?);
+                            positions.sort_unstable();
+                            positions.dedup();
+                        }
                         if !positions.is_empty() && positions.len() <= 10_000 {
                             kmers_hit += 1;
                             // Collect distinct unitigs this k-mer maps to.
