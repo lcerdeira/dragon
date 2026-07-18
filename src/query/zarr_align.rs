@@ -131,9 +131,67 @@ pub fn align_query(
     let max_seeds_per_genome = (query.len() / 16).max(64);
     const CANDIDATE_TARGET: usize = 8000;
 
+    // Per-genome evidence, folded in a single pass.
+    //
+    // Two quantities are tracked separately from `genome_seeds` on purpose:
+    //
+    //  * `distinct_positions` — how many sampled query positions matched this
+    //    genome. It must NOT come from the stored seeds, because those are
+    //    capped at `max_seeds_per_genome` to bound alignment work; deriving
+    //    containment from them capped it at (cap / sampled) instead of the true
+    //    fraction.
+    //  * `info` — IDF-weighted information content, mirroring the binary
+    //    `containment.rs`. Rare unitigs (small colour cardinality) carry high
+    //    IDF; conserved/core unitigs carry ≈0.
+    //
+    // Query positions are visited in increasing order, so each position's best
+    // IDF can be folded into the running sum without storing the positions —
+    // O(1) memory per genome even when a query matches 100k+ genomes.
+    #[derive(Default)]
+    struct Evidence {
+        have_pos: bool,
+        last_pos: usize,
+        best_idf_at_pos: f64,
+        distinct_positions: usize,
+        info: f64,
+    }
+    impl Evidence {
+        fn observe(&mut self, qpos: usize, idf: f64) {
+            if self.have_pos && self.last_pos == qpos {
+                if idf > self.best_idf_at_pos {
+                    self.best_idf_at_pos = idf;
+                }
+            } else {
+                if self.have_pos {
+                    self.info += self.best_idf_at_pos;
+                }
+                self.have_pos = true;
+                self.last_pos = qpos;
+                self.best_idf_at_pos = idf;
+                self.distinct_positions += 1;
+            }
+        }
+        fn finish(&self) -> (usize, f64) {
+            let info = if self.have_pos {
+                self.info + self.best_idf_at_pos
+            } else {
+                self.info
+            };
+            (self.distinct_positions, info)
+        }
+    }
+
+    let num_genomes = (r.path_index.num_genomes() as f64).max(1.0);
     let mut genome_seeds: HashMap<u32, Vec<SeedHit>> = HashMap::new();
+    let mut evidence: HashMap<u32, Evidence> = HashMap::new();
+    // Denominator for containment: the k-mers we actually sampled, not every
+    // k-mer in the query. With stride > 1 (queries beyond ~500 k-mers) dividing
+    // by `total_kmers` capped containment at 1/stride — a perfect 6 kb match
+    // reported 0.09.
+    let mut sampled_kmers = 0usize;
     let mut qpos = 0usize;
     while qpos < total_kmers {
+        sampled_kmers += 1;
         let kmer = &query[qpos..qpos + k];
         for (is_rev, pat) in [(false, kmer.to_vec()), (true, revcomp(kmer))] {
             let positions = r.fm.search(&pat);
@@ -143,7 +201,10 @@ pub fn align_query(
             for pos in positions {
                 if let Some((uid, off)) = r.fm.position_to_unitig(pos) {
                     if let Some(bm) = r.colors.get(uid as usize) {
+                        // IDF = ln(N / |colours(u)|): rare unitig → high, core → ~0.
+                        let idf = (num_genomes / (bm.len().max(1) as f64)).ln().max(0.0);
                         for g in bm.iter() {
+                            evidence.entry(g).or_default().observe(qpos, idf);
                             let bucket = genome_seeds.entry(g).or_default();
                             if bucket.len() < max_seeds_per_genome {
                                 bucket.push(SeedHit {
@@ -169,20 +230,13 @@ pub fn align_query(
     let mut hits: Vec<ContainmentHit> = genome_seeds
         .into_iter()
         .map(|(g, seeds)| {
-            // Distinct matched query positions, not seed instances: a k-mer can
-            // seed several unitig positions and both strands, so seeds.len() would
-            // overcount and push containment above 1.0.
-            let shared = seeds
-                .iter()
-                .map(|s| s.query_pos)
-                .collect::<std::collections::HashSet<_>>()
-                .len();
+            let (shared, info) = evidence.get(&g).map(|e| e.finish()).unwrap_or((0, 0.0));
             ContainmentHit {
                 genome_id: g,
-                containment: shared as f64 / total_kmers.max(1) as f64,
+                containment: shared as f64 / sampled_kmers.max(1) as f64,
                 shared_kmers: shared,
-                total_query_kmers: total_kmers,
-                info_score: shared as f64,
+                total_query_kmers: sampled_kmers,
+                info_score: info,
                 bayes_prob: None,
                 bayes_prob_hc: None,
                 bayes_ani: None,
@@ -190,8 +244,19 @@ pub fn align_query(
             }
         })
         .collect();
-    // Keep the strongest candidates (bounds alignment work).
-    hits.sort_by(|a, b| b.shared_kmers.cmp(&a.shared_kmers));
+    // Keep the strongest candidates (bounds alignment work), ranked by
+    // IDF-weighted information content — the same criterion as the binary
+    // `containment.rs`. Ranking by raw shared-k-mer count instead lets genomes
+    // that merely share the query's conserved/core k-mers outrank the true
+    // source and crowd it out of the candidate cap: that was the dominant
+    // high-divergence recall gap the binary path already fixed.
+    hits.sort_by(|a, b| {
+        b.info_score
+            .partial_cmp(&a.info_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.shared_kmers.cmp(&a.shared_kmers))
+            .then_with(|| a.genome_id.cmp(&b.genome_id))
+    });
     hits.truncate(CANDIDATE_TARGET);
 
     let cap = if max_target_seqs == 0 {
